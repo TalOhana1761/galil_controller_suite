@@ -1,0 +1,25 @@
+{
+  "slots": [
+    {
+      "name": "zero",
+      "pos_a": 5.0,
+      "pos_b": -116.0,
+      "pos_c": 0.0,
+      "timestamp": "2026-04-30T10:22:07"
+    },
+    {
+      "name": "thousand",
+      "pos_a": 861.0,
+      "pos_b": -106.0,
+      "pos_c": -21.0,
+      "timestamp": "2026-04-30T15:21:07"
+    },
+    {
+      "name": "new stuff",
+      "pos_a": 12800.0,
+      "pos_b": 0.0,
+      "pos_c": -8.0,
+      "timestamp": "2026-05-07T11:38:37"
+    }
+  ]
+}

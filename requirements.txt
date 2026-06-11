@@ -1,0 +1,21 @@
+# Galil DMC-4133 Control Suite — Python dependencies
+# Install order matters: gclib C library must be installed first.
+# See README.md for setup instructions.
+
+# Galil Python wrapper (requires gclib C DLL installed from galil.com/sw/gclib)
+# gclib @ https://www.galil.com/sw/pub/python/gclib-1.0.1-py3-none-any.whl
+
+# GUI framework
+PyQt5>=5.15
+
+# Live plots (optional but recommended — dashboard chart requires this)
+pyqtgraph>=0.13
+
+# Structured logging
+loguru>=0.7
+
+# Data validation / settings persistence
+pydantic>=2.0
+
+# Testing
+pytest>=7.0

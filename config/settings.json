@@ -1,0 +1,38 @@
+{
+  "axis_a": {
+    "speed": 4000.0,
+    "accel": 20000.0,
+    "decel": 20000.0,
+    "error_limit": 500.0,
+    "fwd_limit_type": "NO",
+    "rev_limit_type": "NO",
+    "home_limit_type": "NO",
+    "counts_per_um": 6.4
+  },
+  "axis_b": {
+    "speed": 4000.0,
+    "accel": 20000.0,
+    "decel": 20000.0,
+    "error_limit": 500.0,
+    "fwd_limit_type": "NO",
+    "rev_limit_type": "NO",
+    "home_limit_type": "NO",
+    "counts_per_um": 6.4
+  },
+  "axis_c": {
+    "speed": 4000.0,
+    "accel": 20000.0,
+    "decel": 20000.0,
+    "error_limit": 500.0,
+    "fwd_limit_type": "NO",
+    "rev_limit_type": "NO",
+    "home_limit_type": "NO",
+    "counts_per_um": 12.8
+  },
+  "poll_interval_ms": 100,
+  "position_history_depth": 600,
+  "log_file": "galil_log.txt",
+  "display_units": "counts",
+  "auto_reconnect": true,
+  "last_address": "COM3"
+}
