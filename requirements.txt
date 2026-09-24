@@ -14,5 +14,11 @@ loguru>=0.7
 # Data validation / settings persistence
 pydantic>=2.0
 
+# Used by controller/galil_controller.py for a single np.int64() cast when
+# reading _TP. Declared 2026-09-24: it was imported but never listed, so
+# `pip install -r requirements.txt` left a clone that ran in --mock and crashed
+# with ModuleNotFoundError the moment it talked to hardware.
+numpy>=1.24
+
 # Testing
 pytest>=7.0

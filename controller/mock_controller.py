@@ -24,6 +24,7 @@ Trip point defaults (configurable via set_trip_points):
   C:    fwd = +100 000 counts, rev =    −500 counts
 """
 import json
+from utils.app_paths import config_path
 import os
 import random
 from loguru import logger
@@ -34,7 +35,7 @@ AXES = ["A", "B", "C"]
 # Same per-axis scale tables GalilController builds, so move_microns() converts
 # identically in mock and on hardware. Falls back to the AxisSettings defaults if
 # settings.json is missing, since the mock must import without any config.
-_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.json")
+_SETTINGS_PATH = config_path("settings.json")
 try:
     with open(_SETTINGS_PATH, "r") as _f:
         _settings = json.load(_f)

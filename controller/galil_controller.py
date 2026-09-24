@@ -23,9 +23,10 @@ import gclib
 import numpy as np
 from loguru import logger
 from .data_models import AxisStatus, ControllerInfo
+from utils.app_paths import config_path
 
 
-SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.json")
+SETTINGS_PATH = config_path("settings.json")
 
 AXES = ["A", "B", "C"]
 
@@ -48,8 +49,7 @@ AXES = ["A", "B", "C"]
 # on a limit could not be moved at all: move_microns() refuses to guess which way
 # is out. +1 makes the app bootable; the first move on each axis replaces it with
 # the truth and writes it down.
-LAST_DIR_PATH = os.path.join(os.path.dirname(__file__), "..", "config",
-                             "last_direction.json")
+LAST_DIR_PATH = config_path("last_direction.json")
 LAST_DIR_ON_START = +1
 
 

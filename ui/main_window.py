@@ -26,6 +26,7 @@ from ui.panels.jog_panel import JogPanel
 from ui.panels.settings_panel import SettingsPanel
 from utils.soft_limits import SoftLimits
 from utils.zero_offsets import ZeroOffsets
+from utils.app_paths import config_path
 from ui.panels.log_panel import LogPanel
 
 # The Settings panel was removed on 2026-09-23. Everything it could edit is
@@ -325,7 +326,7 @@ class GalilMainWindow(QMainWindow):
 
 
 def _load_settings() -> AppSettings:
-    path = os.path.join(os.path.dirname(__file__), "..", "config", "settings.json")
+    path = config_path("settings.json")
     try:
         import json
         with open(path) as f:

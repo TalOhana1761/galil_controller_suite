@@ -90,6 +90,8 @@ ui/
     log_panel.py             Wired into main_window
     settings_panel.py        Soft travel limits (added 2026-09-24)
 utils/
+  app_paths.py             WHERE config and logs live: repo when run from source,
+                           %LOCALAPPDATA% when frozen. Every config path goes through it
   stage_axes.py            AXIS_NAME/AXIS_SIGN and the stage<->controller converters
   soft_limits.py           Software travel bounds, merged into the poll result
   z_retract_state.py       Whether Z is parked off the tape, across restarts
@@ -97,6 +99,12 @@ utils/
   zero_offsets.py          Display origins: counts zero + micron origin per axis
   unit_converter.py        counts <-> um helpers
   logger_setup.py           loguru + Qt LogBridge for the log panel
+packaging/
+  build_installer.py       ONE command to build the Windows installer
+  make_icon.py             draws galil_suite.ico (no Pillow; QPainter + a hand-packed ICO)
+  galil_suite.spec         PyInstaller: what to freeze, bundle and exclude
+  installer.iss            Inno Setup: the wizard, shortcuts and uninstaller
+  README.md                how to rebuild, and the two things that break it
 config/
   settings.json             Persisted AppSettings (axis params + globals)
   positions.json             Named position memory slots (absolute _TP)
@@ -2138,6 +2146,79 @@ How it was built, since there is no PDF library installed:
   corrected by the first move on each axis, so the assumption only applies until
   then. Solvable properly by measuring the tape origin, which would let position
   alone say which end an axis is on.
+
+## Shipping it: the Windows installer (2026-09-24)
+
+`python packaging/build_installer.py` produces one
+`GalilControllerSuite-Setup-<version>.exe` that carries the Python interpreter,
+PyQt5, numpy, pydantic, loguru and the gclib DLLs. **The target machine needs no
+Python, no pip, no venv and no terminal.** Per-user install by default, so no
+administrator rights. See `packaging/README.md` for the build prerequisites.
+
+### `utils/app_paths.py` — the one place that knows where things live
+
+Installing under `C:\Program Files\` makes the app directory **read-only for a
+normal user**, and this app writes config *during motion*: `last_direction.json`
+is rewritten whenever an axis changes direction, and it is the only record of
+WHICH END of travel A and B are sitting at. A silent write failure there is a
+limit-logic failure later.
+
+So when frozen, and **only** when frozen, the writable state moves:
+
+| | from source | frozen |
+|---|---|---|
+| config | `<repo>/config/` | `%LOCALAPPDATA%/GalilControllerSuite/config/` |
+| log | the working directory | `%LOCALAPPDATA%/GalilControllerSuite/logs/` |
+| read-only data (qss, default config, DLLs) | `<repo>/` | the bundle (`sys._MEIPASS`) |
+
+**Running from a checkout is completely unchanged** — 261 tests pass, the
+hardware scripts and `python run.py` behave exactly as before. That is the point:
+`is_frozen()` is false and every function returns what the old hardcoded
+`__file__` arithmetic returned.
+
+Every module keeps its module-level constant (`SETTINGS_PATH`, `LAST_DIR_PATH`,
+`STATE_PATH`, `DEFAULT_PATH`), so the test-suite redirection described under
+"Tests must not touch `config/`" still works. Only the value they are computed
+from changed. **Anything new that persists to disk must take its path from
+`app_paths`**, or it will work in development and fail for every installed user.
+
+`seed_user_config()` copies the bundled defaults into the user folder on first
+run, **per file and never overwriting**, so an upgrade delivers a config file a
+new version adds without discarding the rig's own calibration.
+
+### Two traps this hit, both now guarded
+
+- **The gclib DLLs are invisible to PyInstaller.** `gclib.py` loads them at
+  RUNTIME via `ctypes.util.find_library`, which searches `PATH` and does *not*
+  look beside the executable. They are declared explicitly in the spec, and
+  `add_bundled_dll_dir()` puts their folder on `PATH` **before** the controller
+  modules import. Verified by stripping Galil off `PATH` entirely and launching
+  the frozen build in hardware mode — which is what a peer's machine looks like.
+- **`numpy` was missing from `requirements.txt`.** `galil_controller.py` has
+  imported it all along for one `np.int64()` cast on the `_TP` read path, but it
+  was never declared. A fresh clone therefore ran in `--mock` and died with
+  `ModuleNotFoundError` the moment it talked to hardware — mock mode never
+  imports that module, which is exactly why it went unnoticed. Declared
+  2026-09-24. The same wrong assumption was made in the spec's `excludes` and
+  produced the identical failure in the frozen build; there is a comment there
+  now. **If that cast is ever replaced with a plain `int()`, numpy can be dropped
+  from both.**
+
+### Config is read at IMPORT time
+
+`galil_controller` and `mock_controller` build their scale tables from
+`settings.json` while the module is importing, not on first use. So `run.py`
+calls `seed_user_config()` and `add_bundled_dll_dir()` **above** the
+`ui.main_window` import, not inside `main()`. Moving them back down would seed
+the config after something had already tried to read it.
+
+### Mock mode shows every axis at a soft limit, and that is correct
+
+The shipped calibration is this rig's: `um_origin` is in the millions of counts,
+while `MockGalilController` starts every axis at 0. The position in microns is
+therefore hugely negative and the soft bounds trip immediately. Pre-existing, not
+caused by packaging — but peers meet it on first launch, so the README says so.
+
 
 ## Running
 

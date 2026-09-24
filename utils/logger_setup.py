@@ -15,6 +15,8 @@ Architecture:
 import os
 from loguru import logger
 
+from utils.app_paths import log_path as _resolve_log_path
+
 
 # ── LogBridge ─────────────────────────────────────────────────────────────────
 # Imported lazily so this module remains importable without PyQt5 installed
@@ -71,7 +73,7 @@ def setup_logger(log_file: str = "galil_log.txt", bridge: "LogBridge | None" = N
     """
     logger.remove()
 
-    log_path = os.path.abspath(log_file)
+    log_path = _resolve_log_path(log_file)
     logger.add(
         log_path,
         rotation="10 MB",

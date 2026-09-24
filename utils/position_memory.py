@@ -5,9 +5,9 @@ import json
 import os
 from datetime import datetime
 from controller.data_models import PositionSlot
+from utils.app_paths import config_path
 
-DEFAULT_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "config", "positions.json")
+DEFAULT_PATH = config_path("positions.json")
 
 
 class PositionMemory:

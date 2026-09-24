@@ -24,6 +24,10 @@ galil_log*.txt
 # sitting at, and z_retract_state.json is the only record of whether the Z head
 # is parked off the scale tape, which nothing on the rig can be asked.
 
+# pytest's cache. It ships its own .gitignore so it was already excluded, but
+# stating it here means the rule does not depend on that file surviving.
+.pytest_cache/
+
 # Virtual environments
 venv/
 .venv/
@@ -50,3 +54,12 @@ Galil/
 # manual that drives the stage the wrong way is worse than no manual.
 # Regenerate it and drop this line. See CLAUDE.md.
 Galil_Controller_Suite_Manual.pdf
+
+# Installer build artifacts (packaging/). The frozen app is ~200 MB and the
+# setup .exe ~80 MB; both are rebuilt from source by
+# `python packaging/build_installer.py`, so neither belongs in git.
+# The generated icon IS tracked - it is an asset, and rebuilding it on every
+# machine would churn the binary for no reason.
+packaging/_dist/
+packaging/_build/
+packaging/_output/

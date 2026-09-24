@@ -47,6 +47,41 @@ for why.
 
 ---
 
+## Install on Windows (no Python needed)
+
+**This is the easy way, and what most people want.**
+
+1. Get `GalilControllerSuite-Setup-<version>.exe`.
+2. Run it. Pick an install folder; tick the desktop shortcut.
+3. Double-click the desktop icon.
+
+That is all. The installer carries its own Python interpreter, PyQt5, numpy,
+pydantic, loguru and the Galil gclib DLLs — **no Python, no pip, no venv and no
+terminal on the target machine.** It installs per-user by default, so
+administrator rights are not required.
+
+Two Start Menu entries are created:
+
+| entry | what it does |
+|---|---|
+| **Galil Controller Suite** | connects to real hardware |
+| **Galil Controller Suite (simulator)** | `--mock`, no hardware needed |
+
+Settings, calibration and logs are kept in
+`%LOCALAPPDATA%\GalilControllerSuite\`, **not** in the install folder — so the
+app works correctly when installed under `C:\Program Files\`, and an uninstall
+offers to keep your calibration for a reinstall.
+
+To build that installer yourself, see [`packaging/README.md`](packaging/README.md).
+
+> **Note on the simulator.** The shipped calibration is for this rig, where the
+> encoders read in the millions of counts, while the mock controller starts every
+> axis at 0. Mock mode therefore opens with all three axes reported at a soft
+> travel limit. That is expected — it is the real zero offsets meeting a
+> simulated stage, not a fault.
+
+---
+
 ## Prerequisites
 
 - Python **3.11 or newer** (tested on 3.12.3)
@@ -54,7 +89,7 @@ for why.
 
 ---
 
-## Installation
+## Running from source (developers)
 
 ### Step 1 — Clone the project
 

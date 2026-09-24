@@ -31,10 +31,9 @@ import json
 import os
 
 from loguru import logger
+from utils.app_paths import config_path
 
-STATE_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "config", "z_retract_state.json")
+STATE_PATH = config_path("z_retract_state.json")
 
 ON_TAPE = "on_tape"
 OFF_TAPE = "off_tape"

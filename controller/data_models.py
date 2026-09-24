@@ -7,9 +7,9 @@ import os
 
 from pydantic import BaseModel, Field
 from typing import Optional
+from utils.app_paths import config_path
 
-SETTINGS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "config", "settings.json")
+SETTINGS_PATH = config_path("settings.json")
 
 
 class AxisStatus(BaseModel):

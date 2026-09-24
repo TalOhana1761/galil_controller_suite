@@ -14,6 +14,15 @@ import argparse
 # Make sure sibling packages resolve correctly when run from any directory
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Both of these must run BEFORE the controller modules are imported: they build
+# their scale tables from settings.json at IMPORT time, and galil_controller
+# pulls in gclib, which resolves its DLLs the moment it loads. Running from
+# source both calls are no-ops - see utils/app_paths.py.
+from utils.app_paths import (seed_user_config, add_bundled_dll_dir,
+                             install_root, config_path)
+seed_user_config()
+add_bundled_dll_dir()
+
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
 
@@ -37,7 +46,7 @@ def main():
     app.setApplicationName("Galil DMC-4133 Control Suite")
 
     # Load dark theme
-    qss_path = os.path.join(os.path.dirname(__file__), "ui", "dark_theme.qss")
+    qss_path = os.path.join(install_root(), "ui", "dark_theme.qss")
     try:
         with open(qss_path, encoding="utf-8") as f:
             app.setStyleSheet(f.read())
@@ -58,7 +67,7 @@ def main():
             # Pre-populate the last_address so the connection panel shows it
             try:
                 import json
-                cfg_path = os.path.join(os.path.dirname(__file__), "config", "settings.json")
+                cfg_path = config_path("settings.json")
                 with open(cfg_path) as f:
                     cfg = json.load(f)
                 cfg["last_address"] = args.address

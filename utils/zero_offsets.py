@@ -38,9 +38,9 @@ import json
 import os
 
 from loguru import logger
+from utils.app_paths import config_path
 
-DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "..", "config", "zero_offsets.json")
+DEFAULT_PATH = config_path("zero_offsets.json")
 
 AXES = ("A", "B", "C")
 
