@@ -26,11 +26,17 @@ MockGalilController  (simulated motion, no hardware needed)
 
 | Panel | Purpose |
 |---|---|
-| **Connection** | Enter IP / COM port, scan network, connect / disconnect |
-| **Dashboard** | Live 3-axis position cards + live position history chart + limit alert banner |
-| **Jog** | XY D-pad (hold-to-move), Z column, limit-switch table, named position memory |
-| **Settings** | Per-axis Speed / Accel / Decel / Error-limit; save to `config/settings.json` |
+| **Connection** | Enter IP / COM port, scan for ports, connect / disconnect; remembers the last port that connected |
+| **Settings** | Soft travel limits per axis, in microns from the display zero |
+| **Jog** | XY D-pad (click to step, hold to jog), Z column with Retract/Insert Z, keyboard jogging (arrows for X/Y, Page Up/Down for Z), Y/Z direction reversed in software to match the stage, live position readout, limit-switch table, HOME / ZERO, named position memory |
 | **Log** | Monospace TX/RX/Error log + raw DMC command input |
+
+The **Dashboard** panel was removed (2026-09-23), and so was the original
+Settings panel. A new Settings panel was added on 2026-09-24, but it edits
+**only the soft travel limits**. Every other motion parameter (speed, accel,
+decel, `counts_per_um`, `travel_mm`) lives in `config/settings.json`, is applied
+by **Enable Motors**, and must be edited in that file by hand. See `CLAUDE.md`
+for why.
 
 ### Stop Buttons (always visible at the bottom)
 
@@ -50,9 +56,16 @@ MockGalilController  (simulated motion, no hardware needed)
 
 ## Installation
 
-### Step 1 — Clone / copy the project
+### Step 1 — Clone the project
 
-Place the `galil_controller_suite` folder anywhere on your machine.
+```bat
+git clone https://github.com/TalOhana1761/galil_controller_suite.git
+cd galil_controller_suite
+```
+
+> The Galil and Numerik Jena vendor manuals and installers are **not** in this
+> repository (they are large and vendor copyrighted). Download gclib and the GDK
+> from <https://www.galil.com/sw/pub/galil/> if you need them.
 
 ### Step 2 — Install Python dependencies
 
@@ -61,7 +74,7 @@ cd galil_controller_suite
 pip install -r requirements.txt
 ```
 
-This installs: `PyQt5`, `pyqtgraph`, `loguru`, `pydantic`, `pytest`.
+This installs: `PyQt5`, `loguru`, `pydantic`, `pytest`.
 
 ---
 
@@ -118,9 +131,13 @@ Replace `COM3` with the actual COM port shown in Device Manager.
 
 ### Step 3 — First-time setup inside the GUI
 
-1. Open the **Connection** panel and click **Connect**.  
-2. Open the **Settings** panel and verify Speed / Accel / Decel values, then click **Save**.  
-3. Use the **Jog** panel to move axes and confirm motion.
+1. Open the **Connection** panel and click **Connect**.
+2. Click **Enable Motors** in the bottom bar. This is what applies the
+   `SP`/`AC`/`DC` values from `config/settings.json` to the controller, along
+   with the encoder and limit configuration.
+3. Park each axis where you want its working zero and press **ZERO X/Y/Z**.
+   Without a zero, **HOME** has nowhere to go and will refuse.
+4. Use the **Jog** panel to move axes and confirm motion.
 
 ---
 
@@ -144,7 +161,8 @@ python run_smoke_test.py --address 192.168.0.40
 pytest tests/ -v
 ```
 
-All 30 tests should pass (no hardware required — tests use the mock controller).
+All **261 tests across 13 files** should pass (no hardware required — the suite
+runs against the mock controller and a fake gclib device).
 
 ---
 
@@ -152,7 +170,7 @@ All 30 tests should pass (no hardware required — tests use the mock controller
 
 ```
 galil_controller_suite/
-├── run.py                  ← Main entry point (full 5-panel GUI)
+├── run.py                  ← Main entry point (3-panel GUI)
 ├── run_smoke_test.py       ← Minimal validation window
 ├── requirements.txt
 │
@@ -167,13 +185,12 @@ galil_controller_suite/
 │   ├── dark_theme.qss      ← Dark stylesheet
 │   └── panels/
 │       ├── connection_panel.py
-│       ├── dashboard_panel.py
 │       ├── jog_panel.py
-│       ├── settings_panel.py
 │       └── log_panel.py
 │
 ├── utils/
 │   ├── position_memory.py  ← Named position slots (saved to JSON)
+│   ├── zero_offsets.py     ← Display origins: counts zero + micron origin
 │   ├── unit_converter.py   ← counts ↔ µm conversion helpers
 │   └── logger_setup.py     ← Loguru configuration
 │
@@ -195,6 +212,7 @@ galil_controller_suite/
 |---|---|
 | `ModuleNotFoundError: gclib` | Install gclib (see above). Use `--mock` if no hardware. |
 | GUI opens but axes show `---` | Controller not connected — check IP/COM and click Connect. |
-| Limit LED stays red | Axis is at a limit; jog in the opposite direction. |
-| Settings not saved after restart | Click **Save** in the Settings panel before closing. |
+| Limit cell stays red | Axis is at a limit; the alert under the table names the direction that escapes. The button driving further in is disabled. |
+| `HOME` says "Not zeroed" | That axis has no counts zero yet. Press **ZERO** for it first. |
+| Motion parameters seem wrong | Edit `config/settings.json`, then press **Enable Motors** — that is what sends `SP`/`AC`/`DC`. A restart is needed for scale constants. |
 | Tests fail | Run `pip install -r requirements.txt` to ensure all deps are present. |

@@ -1,0 +1,52 @@
+# Python bytecode. 40 .pyc files were tracked until 2026-09-23 and showed up as
+# modified on every single run, burying the real diff.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs. galil_log.txt rotates at 10 MB and has produced 10k-line diffs; the
+# hardware test scripts each write their own .log beside themselves.
+galil_log*.txt
+*.log
+
+# NOT ignored: encoder_measure*, encoder_measurements.txt and
+# encoder_average_backlash.txt. They look like generated output but they are
+# tracked measurement records, and ignoring them would hide a re-created one.
+
+# Local machine state, not configuration. These are written by the app at
+# runtime and are specific to one rig and one session.
+#
+# NOT ignored, deliberately: config/settings.json, config/zero_offsets.json,
+# config/positions.json, config/last_direction.json and
+# config/z_retract_state.json. They are hand-edited or carry state that must
+# survive a clone - zero_offsets.json in particular is the rig's declared zero,
+# last_direction.json is the only record of which end of travel A and B are
+# sitting at, and z_retract_state.json is the only record of whether the Z head
+# is parked off the scale tape, which nothing on the rig can be asked.
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# Vendor material, excluded 2026-09-24 when the project was pushed to GitHub.
+# 184 MB of Galil/Numerik Jena manuals and installers - gdk_2.4.1.exe alone is
+# 120 MB, over GitHub's 100 MB per-file hard limit, and all of it is vendor
+# copyrighted and downloadable from galil.com. CLAUDE.md cites files in here
+# (gdk_commands.txt, encoder manual.pdf, manipulator Z.pdf); they stay on disk
+# locally, they are just not redistributed.
+Galil/
+
+# The operator manual is BADLY STALE - every direction in it is wrong for Y and
+# Z since the 2026-09-24 software reversal, and it describes a sidebar and a
+# settings panel that no longer match. Excluded rather than shipped, because a
+# manual that drives the stage the wrong way is worse than no manual.
+# Regenerate it and drop this line. See CLAUDE.md.
+Galil_Controller_Suite_Manual.pdf

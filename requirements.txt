@@ -8,9 +8,6 @@
 # GUI framework
 PyQt5>=5.15
 
-# Live plots (optional but recommended — dashboard chart requires this)
-pyqtgraph>=0.13
-
 # Structured logging
 loguru>=0.7
 

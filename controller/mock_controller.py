@@ -10,23 +10,43 @@ Motion model (each poll_all_axes() call = POLL_DT seconds of real time):
   - Position is hard-clamped at trip boundaries; motion stops at the boundary.
   - wait=True in move commands snaps position directly for test compatibility.
 
-Limit switch model (matches physical wiring):
-  A, B (XY): one switch wired to BOTH FWD+REV DMC inputs.
-             Both fwd_limit and rev_limit become True simultaneously when
-             the position crosses either boundary.  last_direction indicates
-             which end was reached.
-  C   (Z):   two separate switches — REV at start/home, FWD at end-of-travel.
-             Only the relevant limit trips.
+Limit switch model (matches physical wiring, revised 2026-09-24):
+  EVERY axis has exactly ONE switch, tripped mechanically at EITHER end of
+  travel. Crossing either boundary trips it, and LAST_DIRECTION is what decides
+  which flag is raised: last_direction >= 0 sets fwd_limit, < 0 sets rev_limit.
+  Never both - the switch cannot say which end it is, so the software decides.
+
+  Before this, A/B raised BOTH flags together and C was modelled with two
+  independent switches. C never had two; the second was never wired.
 
 Trip point defaults (configurable via set_trip_points):
   A, B: fwd = +50 000 counts,  rev = −50 000 counts
   C:    fwd = +100 000 counts, rev =    −500 counts
 """
+import json
+import os
 import random
 from loguru import logger
 from .data_models import AxisStatus, ControllerInfo
 
 AXES = ["A", "B", "C"]
+
+# Same per-axis scale tables GalilController builds, so move_microns() converts
+# identically in mock and on hardware. Falls back to the AxisSettings defaults if
+# settings.json is missing, since the mock must import without any config.
+_SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "settings.json")
+try:
+    with open(_SETTINGS_PATH, "r") as _f:
+        _settings = json.load(_f)
+except Exception:
+    _settings = {}
+
+MOTOR_COUNTS_PER_UM = {
+    ax: _settings.get(f"axis_{ax.lower()}", {}).get("counts_per_um", 6.4) for ax in AXES
+}
+AXIS_TRAVEL_MM = {
+    ax: _settings.get(f"axis_{ax.lower()}", {}).get("travel_mm", 20.0) for ax in AXES
+}
 
 # Real time per poll cycle — must match PollingWorker.POLL_MS = 100 ms
 POLL_DT = 0.1   # seconds
@@ -57,6 +77,7 @@ class MockGalilController:
         self._servo    = {"A": False, "B": False, "C": False}
         self._home_sw  = {"A": False, "B": False, "C": False}
         self._last_dir = {"A": 0, "B": 0, "C": 0}         # +1=fwd, -1=rev, 0=unknown
+        self._jogging = {"A": 0, "B": 0, "C": 0}          # direction of an active jog
 
         # Motion parameters — stored by set_params() and jog(), affect simulation
         self._sp     = {ax: _DEFAULT_SPEED for ax in AXES}  # position-move cruise speed
@@ -65,6 +86,11 @@ class MockGalilController:
         self._dc     = {ax: _DEFAULT_DECEL for ax in AXES}
         self._in_jog = {ax: False for ax in AXES}            # True while in jog mode
 
+        # BiSS status word per axis; 0 = healthy. See encoder_status().
+        self._enc_status = {ax: 0 for ax in AXES}
+        # Direction of travel when each switch closed, latched on the
+        # transition. See _limit_state().
+        self._limit_trip_dir = {ax: 0 for ax in AXES}
         # Auto-limit trip positions
         self._fwd_trip = dict(_DEFAULT_FWD_TRIP)
         self._rev_trip = dict(_DEFAULT_REV_TRIP)
@@ -84,6 +110,12 @@ class MockGalilController:
 
     def disconnect(self):
         self.info.connected = False
+
+    def reconnect(self) -> bool:
+        """Mock twin of GalilController.reconnect(); nothing to clear."""
+        logger.info("[MOCK] Reconnect requested")
+        self.info.connected = True
+        return True
 
     def discover(self) -> dict:
         return {"MOCK": "DMC-4133-MOCK Rev 1.3k3-SER"}
@@ -150,6 +182,36 @@ class MockGalilController:
         noise = random.gauss(0, min(0.5, new_abs_vel * 0.0001)) if new_abs_vel > 0 else 0.0
         return new_pos + noise
 
+    def _limit_state(self, ax: str, pos: float) -> tuple[bool, bool]:
+        """(fwd, rev) limit state at `pos`, with simulate_*() overrides applied.
+
+        ONE switch per axis: it trips at either boundary and says only "at an
+        end". The last commanded direction resolves which end, so at most one of
+        the two flags is ever True. An override forces the switch pressed AND
+        declares the end, since with one switch a caller cannot say "forward
+        limit" without also saying which way the axis was travelling.
+        """
+        if self._fwd_override[ax]:
+            return True, False
+        if self._rev_override[ax]:
+            return False, True
+        if self._fwd_override[ax] is False or self._rev_override[ax] is False:
+            return False, False        # explicitly cleared
+
+        tripped = (pos >= self._fwd_trip[ax]) or (pos <= self._rev_trip[ax])
+        if not tripped:
+            self._limit_trip_dir[ax] = 0
+            return False, False
+        # Latch which end on the transition and HOLD it. The last commanded
+        # direction cannot serve: a move that drives off the switch sets it the
+        # moment it starts, which would re-label the still-pressed switch as the
+        # end being driven towards and halt the escape. See the real
+        # controller's limit_tripped() for the hardware observation.
+        if not self._limit_trip_dir[ax]:
+            self._limit_trip_dir[ax] = +1 if self._last_dir[ax] >= 0 else -1
+        forward = self._limit_trip_dir[ax] > 0
+        return forward, not forward
+
     def poll_all_axes(self) -> dict:
         result = {}
         for ax in AXES:
@@ -162,19 +224,8 @@ class MockGalilController:
 
             pos = new_pos
 
-            # 2. Auto-detect limit trips from current position
-            if ax in ("A", "B"):
-                # XY: single switch wired to BOTH inputs — both trip together
-                auto_fwd = (pos >= self._fwd_trip[ax]) or (pos <= self._rev_trip[ax])
-                auto_rev = auto_fwd
-            else:
-                # Z: two separate switches
-                auto_fwd = pos >= self._fwd_trip[ax]
-                auto_rev = pos <= self._rev_trip[ax]
-
-            # 3. Apply manual overrides (simulate_* calls take precedence)
-            fwd = self._fwd_override[ax] if self._fwd_override[ax] is not None else auto_fwd
-            rev = self._rev_override[ax] if self._rev_override[ax] is not None else auto_rev
+            # 2-3. Limit state at this position (manual overrides included)
+            fwd, rev = self._limit_state(ax, pos)
 
             # 4. Hard-clamp at limit boundary — stop motion
             if fwd or rev:
@@ -200,10 +251,7 @@ class MockGalilController:
 
             result[ax] = AxisStatus(
                 pos            = pos,
-                pos_ref        = self._target[ax],
                 vel            = self._cur_vel[ax],
-                err            = random.gauss(0, 0.3) if self._servo[ax] else 0.0,
-                torque         = random.gauss(0, 0.1) if self._servo[ax] else 0.0,
                 stop_code      = sc,
                 servo_on       = self._servo[ax],
                 fwd_limit      = fwd,
@@ -221,6 +269,11 @@ class MockGalilController:
                 self._servo[ax] = True
         logger.info(f"[MOCK] Enable {axes}")
 
+    def enable_biss(self, axes: str = "ABC"):
+        """Mock stand-in for GalilController.enable_biss (no real BiSS hardware to configure)."""
+        self.enable_axes(axes)
+        logger.info(f"[MOCK] Enable {axes} (BiSS)")
+
     def disable_axes(self, axes: str = "ABC"):
         for ax in axes:
             if ax in AXES:
@@ -230,6 +283,9 @@ class MockGalilController:
         logger.info(f"[MOCK] Disable {axes}")
 
     # ── Motion stop commands ────────────────────────────────────────────────
+
+    def is_jogging(self, axis: str) -> int:
+        return self._jogging.get(axis.upper(), 0)
 
     def halt_axis(self, axis: str):
         """Decelerated stop: set target so axis decelerates naturally to rest."""
@@ -241,9 +297,12 @@ class MockGalilController:
         else:
             self._target[axis] = self._pos[axis]
         self._in_jog[axis] = False
+        self._jogging[axis] = 0
         logger.info(f"[MOCK] Halt {axis}")
 
     def halt_all(self):
+        for _ax in AXES:
+            self._jogging[_ax] = 0
         for ax in AXES:
             self.halt_axis(ax)
         logger.info("[MOCK] Halt ALL")
@@ -276,7 +335,13 @@ class MockGalilController:
     # ── Motion commands ─────────────────────────────────────────────────────
 
     def jog(self, axis: str, speed: float):
-        """Continuous jog toward effectively infinite target; call halt_axis() to stop."""
+        """Continuous jog toward effectively infinite target; call halt_axis() to stop.
+
+        Matches GalilController.jog(): `speed` is MOTOR COUNTS PER SECOND. The
+        real one used to take microns and do a PR move, which is why the two
+        disagreed until 2026-09-23.
+        """
+        self._jogging[axis] = +1 if speed >= 0 else -1
         self._jog_sp[axis] = abs(float(speed)) if speed != 0 else _DEFAULT_SPEED
         self._in_jog[axis] = True
         if speed >= 0:
@@ -287,6 +352,146 @@ class MockGalilController:
             self._last_dir[axis] = -1
         direction = "FWD" if speed >= 0 else "REV"
         logger.info(f"[MOCK] Jog {axis} {direction} @ {abs(float(speed)):.0f} counts/s")
+
+    def move_microns(self, axis: str, microns: float, speed=None,
+                     tol_counts: float = 1.0, gain: float = 0.9,
+                     max_steps: int = 40, settle_ms: int = 20,
+                     timeout: int = 30, snap: bool = True,
+                     fine_speed=None, fine_below_um: float = 5.0,
+                     settle_window_ms: int = 200,
+                     button_state_callback=None,
+                     absolute_target=None) -> float:
+        """Move one axis a signed distance in microns, closing the loop on the
+        simulated position — mock twin of GalilController.move_microns().
+
+        Same signature, same conversion table, same guards and the same
+        step/measure/correct loop. One difference is unavoidable: the mock has no
+        separate encoder, so its position IS the motor count and one commanded
+        count moves it by one count. On hardware the encoder reads 12.8 counts/um
+        against the motor's 6.4, so a single microstep moves the encoder 2 counts
+        and tol_counts is measured against that finer scale.
+        """
+        axis = axis.upper()
+        if axis not in AXES:
+            raise ValueError(f"Unknown axis {axis!r}; expected one of {AXES}")
+
+        microns = float(microns)
+        if microns == 0.0:
+            return 0.0
+
+        # Accepted and ignored, so this stays a drop-in: the mock has no settling
+        # tail to wait out and no real speed, so settle_window_ms, fine_speed and
+        # fine_below_um have nothing to act on here.
+        btn_dir = "+" if microns > 0 else "-"
+        if button_state_callback is not None:
+            button_state_callback(axis, btn_dir, False)
+        try:
+            return self._move_microns(axis, microns, speed, tol_counts, gain,
+                                      max_steps, timeout, snap)
+        finally:
+            if button_state_callback is not None:
+                button_state_callback(axis, btn_dir, True)
+
+    def _move_microns(self, axis, microns, speed, tol_counts, gain, max_steps,
+                      timeout, snap) -> float:
+        cpm_axis = MOTOR_COUNTS_PER_UM[axis]
+        if snap:
+            # Only whole microsteps exist; see GalilController.move_microns.
+            snapped = round(microns * cpm_axis) / cpm_axis
+            if snapped == 0.0:
+                logger.info(f"[MOCK] {axis}: {microns:+.4f} um is under half a "
+                            f"microstep ({1.0 / cpm_axis:.5f} um); nothing to command")
+                return 0.0
+            if snapped != microns:
+                logger.info(f"[MOCK] {axis}: {microns:+.4f} um is not a whole "
+                            f"microstep; targeting {snapped:+.5f} um instead")
+            microns = snapped
+
+        travel_um = AXIS_TRAVEL_MM[axis] * 1000.0
+        if abs(microns) > travel_um:
+            raise ValueError(
+                f"{axis}: {microns:+.1f} um exceeds the axis travel of "
+                f"{travel_um:.0f} um, and LD=3 leaves no hardware limit to catch it"
+            )
+
+        direction = +1 if microns > 0 else -1
+        fwd, rev = self._limit_state(axis, self._pos[axis])
+        if (fwd and direction > 0) or (rev and direction < 0):
+            raise RuntimeError(
+                f"{axis}: limit active - {microns:+.1f} um drives further into it"
+            )
+
+        cpm = MOTOR_COUNTS_PER_UM[axis]
+        tol = max(float(tol_counts), 0.0)
+
+        start = self._pos[axis]
+        target = start + microns * cpm
+        logger.info(
+            f"[MOCK] Move {axis} {microns:+.3f} um: {start:.0f} -> {target:.0f} counts, "
+            f"tolerance {tol:.0f} counts ({tol / cpm:.3f} um)"
+        )
+
+        error = target - start
+        no_progress = 0
+
+        for step in range(1, max_steps + 1):
+            if abs(error) <= tol:
+                break
+
+            fwd, rev = self._limit_state(axis, self._pos[axis])
+            if (fwd and error > 0) or (rev and error < 0):
+                logger.warning(
+                    f"[MOCK] {axis}: limit tripped during move, stopping "
+                    f"{error / cpm:+.3f} um short of target"
+                )
+                break
+
+            counts = int(round(error * gain))
+            if counts == 0:
+                logger.info(
+                    f"[MOCK] {axis}: {error:+.0f} counts "
+                    f"({error / cpm:+.4f} um) left, below one step - "
+                    f"at the resolution floor"
+                )
+                break
+            if (counts > 0) != (direction > 0):
+                logger.warning(
+                    f"[MOCK] {axis}: overshot by {-error / cpm:+.4f} um; "
+                    f"not reversing into backlash to fix it"
+                )
+                break
+
+            self.move_relative(axis, counts, speed=speed, wait=True, timeout=timeout)
+            new_error = target - self._pos[axis]
+            logger.debug(
+                f"[MOCK] Move {axis} step {step}: commanded {counts:+d} counts, "
+                f"error {error:+.0f} -> {new_error:+.0f} counts"
+            )
+
+            if abs(new_error) < abs(error):
+                no_progress = 0
+            else:
+                no_progress += 1
+                if no_progress >= 3:
+                    logger.warning(
+                        f"[MOCK] {axis}: no progress in 3 steps, stopping at "
+                        f"{new_error:+.0f} counts ({new_error / cpm:+.3f} um) of error"
+                    )
+                    error = new_error
+                    break
+            error = new_error
+        else:
+            logger.warning(
+                f"[MOCK] {axis}: hit max_steps={max_steps} with {error:+.0f} counts "
+                f"({error / cpm:+.3f} um) still to go"
+            )
+
+        moved_um = (self._pos[axis] - start) / cpm
+        logger.info(
+            f"[MOCK] Move {axis} done: commanded {microns:+.3f} um, measured "
+            f"{moved_um:+.3f} um (error {error / cpm:+.4f} um)"
+        )
+        return moved_um
 
     def move_relative(self, axis: str, counts: float, speed=None,
                       wait: bool = False, timeout: int = 30):
@@ -312,17 +517,65 @@ class MockGalilController:
             self._cur_vel[axis] = 0.0
         logger.info(f"[MOCK] Move absolute {axis} → {float(counts):.0f} counts")
 
+    def post_move_verify(self, axis: str, target_counts: float, **kwargs) -> float:
+        """Mock twin of GalilController.post_move_verify().
+
+        The mock has no relaxation to wait out - its moves land where they are
+        told - so this only re-measures and reports. It exists so the same call
+        works in --mock without special-casing, and so the tests can exercise the
+        callers.
+        """
+        axis = axis.upper()
+        if axis not in AXES:
+            raise ValueError(f"Unknown axis {axis!r}; expected one of {AXES}")
+        error = (float(target_counts) - self._pos[axis]) / MOTOR_COUNTS_PER_UM[axis]
+        logger.info(f"[MOCK] {axis}: verified, {error:+.4f} um from target")
+        return error
+
+    def move_to_counts(self, axis: str, target_counts: float, verify: bool = False,
+                       undershoot_um: float = 0.45, relax_s: float = 1.0,
+                       **kwargs) -> float:
+        """Closed-loop move to an absolute position — mock twin of
+        GalilController.move_to_counts().
+
+        verify/undershoot_um/relax_s are accepted so the signature matches; the
+        mock has no relaxation, so aiming short would simply land short. It
+        therefore goes straight to the target and verifies.
+        """
+        axis = axis.upper()
+        if axis not in AXES:
+            raise ValueError(f"Unknown axis {axis!r}; expected one of {AXES}")
+
+        error = float(target_counts) - self._pos[axis]
+        if abs(error) <= kwargs.get("tol_counts", 1.0):
+            logger.info(f"[MOCK] {axis}: already within tolerance of "
+                        f"{target_counts:.0f}")
+            return 0.0
+        moved = self.move_microns(axis, error / MOTOR_COUNTS_PER_UM[axis],
+                                  snap=False, **kwargs)
+        if verify:
+            self.post_move_verify(axis, float(target_counts))
+        return moved
+
     def move_all_absolute(self, positions: dict, speeds: dict = None,
-                          wait: bool = False, timeout: int = 60):
-        for ax, pos in positions.items():
-            self._in_jog[ax] = False
+                          wait: bool = True, timeout: int = 60,
+                          verify: bool = False, **kwargs):
+        """Drive several axes to absolute readings, one after another."""
+        # `wait` is accepted and ignored: a closed loop is blocking by nature,
+        # there is no non-blocking form to choose. It stays in the signature so
+        # existing callers keep working.
+        results = {}
+        for ax, target in positions.items():
+            per_axis = dict(kwargs)
             if speeds and ax in speeds:
-                self._sp[ax] = float(speeds[ax])
-            self._last_dir[ax] = +1 if pos >= self._pos[ax] else -1
-            self._target[ax] = float(pos)
-            if wait:
-                self._pos[ax]    = float(pos)
-                self._cur_vel[ax] = 0.0
+                per_axis["speed"] = speeds[ax]
+            per_axis.setdefault("verify", verify)
+            try:
+                results[ax] = self.move_to_counts(ax, target, **per_axis)
+            except (RuntimeError, ValueError) as e:
+                logger.error(f"[MOCK] move_all_absolute {ax}: {e}")
+                results[ax] = 0.0
+        return results
 
     def define_zero(self, axes: str = "ABC"):
         for ax in axes:
@@ -333,11 +586,19 @@ class MockGalilController:
                 self._in_jog[ax]  = False
         logger.info(f"[MOCK] Define zero {axes}")
 
-    def home_axis(self, axis: str):
-        self._last_dir[axis] = -1
-        self._target[axis] = 0.0
-
     # ── Simulation helpers ──────────────────────────────────────────────────
+
+    def encoder_status(self, axis: str) -> int:
+        """_SSm0 stand-in. 0 = healthy; simulate_encoder_status() overrides it.
+
+        The real one reports bit 3 when the head is off the scale tape, which is
+        what the Z insert waits to clear.
+        """
+        return int(self._enc_status.get(axis.upper(), 0))
+
+    def simulate_encoder_status(self, axis: str, value: int):
+        """Force the BiSS status word, e.g. 8 (error) for a head off the tape."""
+        self._enc_status[axis.upper()] = int(value)
 
     def simulate_fwd_limit(self, axis: str, active: bool = True):
         """Manually force the fwd_limit state (overrides position-based auto-detection)."""

@@ -109,27 +109,32 @@ def _drive_to(ctrl, axis, target, max_polls=2000):
     return ctrl.poll_all_axes()
 
 
-def test_xy_both_limits_trip_on_fwd_boundary(ctrl):
-    """Moving A past the fwd trip point should activate BOTH fwd and rev limits."""
+def test_only_the_fwd_flag_trips_after_a_forward_move(ctrl):
+    """One switch per axis. Reaching it going FORWARD means the forward end, so
+    only that flag rises - until 2026-09-24 A and B raised both together, which
+    reads as "blocked in both directions" and leaves no way off the switch."""
     ctrl.set_trip_points("A", fwd=10_000.0, rev=-10_000.0)
     _drive_to(ctrl, "A", 12_000.0)
     # Snap will hold near 10000; just poll a few times to ensure auto-detect fires
     for _ in range(3):
         ctrl.poll_all_axes()
     s = ctrl.poll_all_axes()["A"]
+    assert s.last_direction >= 0, "the drive should have recorded + as last"
     assert s.fwd_limit is True,  "FWD limit should be active"
-    assert s.rev_limit is True,  "REV limit must also be active (XY wiring)"
+    assert s.rev_limit is False, "the switch cannot be at both ends at once"
 
 
-def test_xy_both_limits_trip_on_rev_boundary(ctrl):
-    """Moving A past the rev trip point should activate BOTH limits."""
+def test_only_the_rev_flag_trips_after_a_reverse_move(ctrl):
+    """The same physical switch, the opposite conclusion, because the axis got
+    there going the other way."""
     ctrl.set_trip_points("A", fwd=10_000.0, rev=-10_000.0)
     _drive_to(ctrl, "A", -12_000.0)
     for _ in range(3):
         ctrl.poll_all_axes()
     s = ctrl.poll_all_axes()["A"]
-    assert s.fwd_limit is True
+    assert s.last_direction < 0, "the drive should have recorded - as last"
     assert s.rev_limit is True
+    assert s.fwd_limit is False
 
 
 def test_xy_limits_clear_when_back_in_bounds(ctrl):

@@ -6,9 +6,7 @@ Bottom bar contains:
   HALT (ST)     — decelerated stop, motors remain enabled
   E-STOP (AB+MO) — immediate hard cut, bypasses queue
 """
-import sys
 import os
-import json
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
@@ -26,15 +24,20 @@ from ui.polling_worker import PollingWorker
 from ui.panels.connection_panel import ConnectionPanel
 from ui.panels.jog_panel import JogPanel
 from ui.panels.settings_panel import SettingsPanel
+from utils.soft_limits import SoftLimits
+from utils.zero_offsets import ZeroOffsets
 from ui.panels.log_panel import LogPanel
 
-POSITION_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "config", "last_positions.json")
-
+# The Settings panel was removed on 2026-09-23. Everything it could edit is
+# either hardcoded in galil_controller.py (KS, the fine-approach speed, the
+# settle windows, the relaxation constants) or lives in config/settings.json,
+# where SP/AC/DC have been tuned and measured and should not be nudged from a
+# spin box mid-session. enable_axes() is what applies them to the hardware.
 NAV_ITEMS = [
     ("🔌  Connection",  0),
     ("🕹  Jog Control", 1),
-    ("⚙   Settings",   2),
-    ("📋  Log",        3),
+    ("📋  Log",        2),
+    ("⚙  Settings",       3),
 ]
 
 
@@ -45,7 +48,16 @@ class GalilMainWindow(QMainWindow):
         self.use_mock = use_mock
         self.settings = _load_settings()
         self.memory = PositionMemory()
-        self.worker = PollingWorker(controller)
+        # ONE ZeroOffsets for the whole app. The jog panel displays from it and
+        # the soft limits measure from it; two instances would drift the moment
+        # either wrote.
+        self.zeros = ZeroOffsets()
+        # Soft travel limits are applied to every poll result before it is
+        # emitted or guarded, so they are indistinguishable from a switch to
+        # everything downstream. Holds references to settings and zeros, so an
+        # edit in the Settings panel takes effect on the next poll.
+        self.worker = PollingWorker(
+            controller, soft_limits=SoftLimits(self.settings, self.zeros))
         self._active_nav = 0
 
         self._build_ui()
@@ -93,14 +105,14 @@ class GalilMainWindow(QMainWindow):
         self._conn_panel = ConnectionPanel(
             self.controller, self.worker, self.settings)
         self._jog_panel  = JogPanel(
-            self.controller, self.worker, self.settings, self.memory)
-        self._set_panel  = SettingsPanel(
-            self.controller, self.worker, self.settings)
+            self.controller, self.worker, self.settings, self.memory,
+            zeros=self.zeros)
         self._log_panel  = LogPanel(
             self.controller, self.worker)
+        self._settings_panel = SettingsPanel(self.settings)
 
-        for panel in [self._conn_panel, self._jog_panel,
-                      self._set_panel, self._log_panel]:
+        for panel in [self._conn_panel, self._jog_panel, self._log_panel,
+                      self._settings_panel]:
             self._stack.addWidget(panel)
 
         self._nav_buttons[0].click()
@@ -178,19 +190,13 @@ class GalilMainWindow(QMainWindow):
         bl.addWidget(self._conn_indicator)
         bl.addStretch()
 
-        # Zero All
-        btn_zero = QPushButton("ZERO ALL")
-        btn_zero.clicked.connect(lambda: self.worker.queue_command(
-            self.controller.define_zero, "ABC"))
-        bl.addWidget(btn_zero)
-
         # Enable / Disable
         btn_enable = QPushButton("Enable Motors")
         btn_enable.setObjectName("btn_enable")
         btn_enable.setToolTip("Enable stepper motors. Stepper mode does not use Galil SH servo-enable.")
         btn_enable.clicked.connect(lambda: (
             #self.worker.queue_command(self.controller.configure_stepper_axes, "ABC", 2),
-            self.worker.queue_command(self.controller.enable_axes, "ABC")
+            self.worker.queue_command(self.controller.enable_biss, "ABC")
         ))
         bl.addWidget(btn_enable)
 
@@ -247,7 +253,6 @@ class GalilMainWindow(QMainWindow):
         self.worker.status_updated.connect(self._on_status_sidebar)
         self.worker.error_occurred.connect(self._log_panel.on_error)
 
-        self._set_panel.settings_applied.connect(self._on_settings_applied)
         self._conn_panel.connected.connect(self._on_connected)
         self._conn_panel.disconnected.connect(self._on_disconnected)
 
@@ -271,10 +276,6 @@ class GalilMainWindow(QMainWindow):
     def _on_disconnected(self):
         self._conn_indicator.setText("● Disconnected")
         self._conn_indicator.setStyleSheet("color: #8B949E;")
-
-    @pyqtSlot(object)
-    def _on_settings_applied(self, settings: AppSettings):
-        self.settings = settings
 
     def _on_worker_started(self):
         self._conn_indicator.setText("● MOCK — live")
@@ -301,29 +302,25 @@ class GalilMainWindow(QMainWindow):
     # ── Shutdown ─────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
-        # Save last positions
-        # try:
-        #     positions = {
-        #         "axis_a": {"last_position": self.controller.poll_all_axes().get("axis_a", 0), "last_direction": self._dash_panel.axis_a_status.last_direction},
-        #         "axis_b": {"last_position": self.controller.poll_all_axes().get("axis_b", 0), "last_direction": self._dash_panel.axis_b_status.last_direction},
-        #         "axis_c": {"last_position": self.controller.poll_all_axes().get("axis_c", 0), "last_direction": self._dash_panel.axis_c_status.last_direction},
-        #     }
-        #     with open(POSITION_PATH, "w") as f:
-        #         json.dump(positions, f, indent=2)
-        # except Exception:
-        #     pass
-
         logger.info("Shutting down application...")
 
         if self.worker.isRunning():
             self.worker.stop()
+
+        # Two separate guards on purpose: AppSettings.save_to_file() did not
+        # exist until now, so an AttributeError on the first line was silently
+        # skipping the controller teardown below it — the app exited without
+        # halting, disabling or closing the link.
         try:
             self.settings.save_to_file()
+        except Exception as e:
+            logger.warning(f"Could not save settings on exit: {e}")
+        try:
             self.controller.halt_all()
             self.controller.disable_axes("ABC")
             self.controller.disconnect()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Controller shutdown: {e}")
         event.accept()
 
 

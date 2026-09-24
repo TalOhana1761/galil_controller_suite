@@ -3,36 +3,33 @@
     "speed": 4000.0,
     "accel": 20000.0,
     "decel": 20000.0,
-    "error_limit": 500.0,
-    "fwd_limit_type": "NO",
-    "rev_limit_type": "NO",
-    "home_limit_type": "NO",
-    "counts_per_um": 6.4
+    "counts_per_um": 6.4,
+    "travel_mm": 20.0,
+    "encoder_length_mm": 45.0,
+    "soft_limit_neg_um": -1000.0,
+    "soft_limit_pos_um": 1000.0
   },
   "axis_b": {
     "speed": 4000.0,
     "accel": 20000.0,
     "decel": 20000.0,
-    "error_limit": 500.0,
-    "fwd_limit_type": "NO",
-    "rev_limit_type": "NO",
-    "home_limit_type": "NO",
-    "counts_per_um": 6.4
+    "counts_per_um": 6.4,
+    "travel_mm": 20.0,
+    "encoder_length_mm": 45.0,
+    "soft_limit_neg_um": -1000.0,
+    "soft_limit_pos_um": 2000.0
   },
   "axis_c": {
     "speed": 4000.0,
     "accel": 20000.0,
     "decel": 20000.0,
-    "error_limit": 500.0,
-    "fwd_limit_type": "NO",
-    "rev_limit_type": "NO",
-    "home_limit_type": "NO",
-    "counts_per_um": 12.8
+    "counts_per_um": 6.4,
+    "travel_mm": 200.0,
+    "encoder_length_mm": 200.0,
+    "soft_limit_neg_um": -100.0,
+    "soft_limit_pos_um": 10000.0
   },
-  "poll_interval_ms": 100,
-  "position_history_depth": 600,
-  "log_file": "galil_log.txt",
-  "display_units": "counts",
-  "auto_reconnect": true,
-  "last_address": "COM3"
+  "last_address": "COM4",
+  "serial_baud": 0,
+  "encoder_counts_per_um": 12.8
 }

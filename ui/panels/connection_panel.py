@@ -3,15 +3,40 @@ Panel 1 — Connection & Controller Info.
 Handles GOpen / GClose and displays controller identity.
 Connection is established in a one-shot QThread so the UI stays responsive.
 """
+import re
 import time
+
+from loguru import logger
+
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QPushButton, QLineEdit,
-    QComboBox, QSpinBox, QRadioButton, QCheckBox,
-    QListWidget, QListWidgetItem, QFrame, QSizePolicy,
+    QComboBox, QRadioButton,
+    QListWidget, QListWidgetItem,
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QFont
+
+_SERIAL_RE = re.compile(r"COM\d+", re.IGNORECASE)
+
+
+def _split_address(addr: str):
+    """Split a gclib address into (port, baud).
+
+    What is stored in settings.last_address is what GOpen was handed on the last
+    successful connect, so it can carry gclib options: `--baud N` from the serial
+    form here, or appended by GalilController.connect() from settings.serial_baud.
+    Subscribe flags are dropped — which messages to subscribe to is a per-session
+    choice, not part of identifying the port.
+    """
+    tokens = addr.strip().split()
+    if not tokens:
+        return "", ""
+    baud = ""
+    for i, tok in enumerate(tokens):
+        if tok == "--baud" and i + 1 < len(tokens):
+            baud = tokens[i + 1]
+    return tokens[0], baud
 
 
 class _ConnectThread(QThread):
@@ -49,7 +74,6 @@ class _ScanThread(QThread):
 class ConnectionPanel(QWidget):
     connected    = pyqtSignal(object, object)   # controller, worker
     disconnected = pyqtSignal()
-    settings_changed = pyqtSignal(str)          # new address
 
     def __init__(self, controller, worker, settings, parent=None):
         super().__init__(parent)
@@ -61,6 +85,7 @@ class ConnectionPanel(QWidget):
         self._uptime_t0 = None
 
         self._build_ui()
+        self._restore_last_address()
 
         self._uptime_timer = QTimer(self)
         self._uptime_timer.timeout.connect(self._update_uptime)
@@ -93,7 +118,7 @@ class ConnectionPanel(QWidget):
         self._eth_grp = QGroupBox("Ethernet / USB Connection")
         eg = QGridLayout(self._eth_grp)
         eg.addWidget(QLabel("Address / Port:"), 0, 0)
-        self._addr_input = QLineEdit(self.settings.last_address)
+        self._addr_input = QLineEdit()
         self._addr_input.setPlaceholderText("e.g. 192.168.0.40 or COM3")
         eg.addWidget(self._addr_input, 0, 1)
         eg.addWidget(QLabel("Subscribe:"), 1, 0)
@@ -108,6 +133,8 @@ class ConnectionPanel(QWidget):
         sg.addWidget(QLabel("COM Port:"), 0, 0)
         self._com_combo = QComboBox()
         self._com_combo.addItems(["COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8"])
+        self._com_combo.setPlaceholderText("— select a port —")
+        self._com_combo.setCurrentIndex(-1)
         sg.addWidget(self._com_combo, 0, 1)
         sg.addWidget(QLabel("Baud Rate:"), 1, 0)
         self._baud_combo = QComboBox()
@@ -116,19 +143,12 @@ class ConnectionPanel(QWidget):
         self._ser_grp.setVisible(False)
         root.addWidget(self._ser_grp)
 
-        # Timeout
-        to_row = QHBoxLayout()
-        to_row.addWidget(QLabel("Timeout (ms):"))
-        self._timeout_spin = QSpinBox()
-        self._timeout_spin.setRange(500, 30000)
-        self._timeout_spin.setValue(5000)
-        self._timeout_spin.setSingleStep(500)
-        to_row.addWidget(self._timeout_spin)
-        self._auto_reconnect = QCheckBox("Auto-reconnect on drop")
-        self._auto_reconnect.setChecked(self.settings.auto_reconnect)
-        to_row.addWidget(self._auto_reconnect)
-        to_row.addStretch()
-        root.addLayout(to_row)
+        # Removed 2026-09-23: a "Timeout (ms)" spin box and an "Auto-reconnect on
+        # drop" checkbox. Neither was ever read. The gclib timeout is whatever the
+        # library defaults to, and reconnection is unconditional - PollingWorker
+        # rebuilds the link after FAULTS_BEFORE_RECONNECT consecutive link faults,
+        # capped at MAX_RECONNECT_ATTEMPTS. A checkbox implying it could be turned
+        # off was worse than no checkbox.
 
         # Connect / Disconnect / Scan buttons
         btn_row = QHBoxLayout()
@@ -171,7 +191,6 @@ class ConnectionPanel(QWidget):
             ("serial",   "Serial No."),
             ("firmware", "Firmware"),
             ("address",  "Address"),
-            ("latency",  "Latency"),
             ("uptime",   "Uptime"),
         ]):
             ig.addWidget(QLabel(f"{lbl}:"), i, 0)
@@ -181,6 +200,51 @@ class ConnectionPanel(QWidget):
             self._info_labels[key] = val
         root.addWidget(info_grp)
         root.addStretch()
+
+    # ── Last connected address ──────────────────────────────────────────────
+
+    def _restore_last_address(self):
+        """Present the address of the last SUCCESSFUL connection.
+
+        If none is recorded — a fresh install, or nothing has ever connected —
+        nothing is presented: the address field stays empty and the COM combo
+        stays unselected, rather than offering a port that was never tested.
+        """
+        port, baud = _split_address(self.settings.last_address)
+        if not port:
+            return
+
+        if _SERIAL_RE.fullmatch(port):
+            port = port.upper()
+            if self._com_combo.findText(port) < 0:
+                self._com_combo.addItem(port)   # remembered a port outside COM1-8
+            self._com_combo.setCurrentText(port)
+            if baud:
+                if self._baud_combo.findText(baud) < 0:
+                    self._baud_combo.addItem(baud)   # a rate outside the usual three
+                self._baud_combo.setCurrentText(baud)
+            self._rb_ser.setChecked(True)       # also flips the visible group
+        else:
+            self._addr_input.setText(port)
+
+    def _remember_address(self, addr: str):
+        """Record the address that just connected, for the next launch.
+
+        Written as soon as the connection succeeds rather than at shutdown:
+        closeEvent does not run if the app is killed or crashes, and a port that
+        connected is exactly the thing worth keeping from such a session.
+        """
+        port, baud = _split_address(addr)
+        if not port:
+            return
+        stored = f"{port} --baud {baud}" if baud else port
+        if stored == self.settings.last_address:
+            return
+        self.settings.last_address = stored
+        try:
+            self.settings.save_to_file()
+        except Exception as e:
+            logger.warning(f"Could not persist the last address ({stored}): {e}")
 
     # ── Mode toggle ─────────────────────────────────────────────────────────
 
@@ -224,6 +288,7 @@ class ConnectionPanel(QWidget):
         self._connect_thread.start()
 
     def _on_connected(self, info):
+        self._remember_address(info.address)
         self._btn_connect.setText("CONNECT")
         self._btn_connect.setEnabled(False)
         self._btn_disconnect.setEnabled(True)
@@ -307,5 +372,7 @@ class ConnectionPanel(QWidget):
         m, s = divmod(m, 60)
         self._info_labels["uptime"].setText(f"{h:02d}:{m:02d}:{s:02d}")
 
-    def update_latency(self, ms: float):
-        self._info_labels["latency"].setText(f"{ms:.1f} ms")
+    # update_latency() was removed on 2026-09-23 along with the Latency row: it
+    # had no callers, so the field never showed anything. ControllerInfo.latency_ms
+    # is still measured on every command and still goes to the DEBUG log; if it is
+    # wanted on screen again, the worker has to push it after a poll.
