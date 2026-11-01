@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-r"""PyInstaller spec for the Galil Controller Suite.
+r"""PyInstaller spec for the Stork Controller (the Galil Controller Suite).
 
 Build with ``python packaging/build_installer.py``, not by hand - that script
 regenerates the icon, runs this spec and then compiles the Inno Setup installer.
@@ -48,6 +48,8 @@ if _missing:
 datas = [
     (os.path.join(HERE, "ui", "dark_theme.qss"), "ui"),
     (os.path.join(HERE, "config"), "config"),
+    # The window icon, read at runtime by utils.app_paths.icon_path().
+    (os.path.join(PKG, "stork.ico"), "packaging"),
 ]
 
 a = Analysis(
@@ -83,14 +85,14 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="GalilControllerSuite",
+    name="StorkController",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     console=False,                       # GUI app - no console window
     disable_windowed_traceback=False,
-    icon=os.path.join(PKG, "galil_suite.ico"),
+    icon=os.path.join(PKG, "stork.ico"),
 )
 
 coll = COLLECT(
@@ -99,5 +101,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="GalilControllerSuite",
+    name="StorkController",
 )

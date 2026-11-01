@@ -27,7 +27,7 @@
     "travel_mm": 200.0,
     "encoder_length_mm": 200.0,
     "soft_limit_neg_um": -100.0,
-    "soft_limit_pos_um": 10000.0
+    "soft_limit_pos_um": 1000000.0
   },
   "last_address": "COM4",
   "serial_baud": 0,

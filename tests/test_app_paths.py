@@ -181,3 +181,41 @@ def test_frozen_dll_dir_found_in_the_gclib_subfolder_too(frozen, monkeypatch):
     app_paths.add_bundled_dll_dir()
 
     assert os.path.abspath(str(sub)) in os.environ["PATH"]
+
+
+def test_seed_forgets_the_build_machines_port(frozen):
+    """The bundled settings.json carries the BUILD PC's last port ("COM4").
+
+    It is per-PC: inheriting it opened a peer's connection panel on a port that
+    was never theirs. Everything else in the file is calibration and stays.
+    """
+    import json
+    bundle, _ = frozen
+    (bundle / "config" / "settings.json").write_text(
+        json.dumps({"last_address": "COM4", "encoder_counts_per_um": 12.8}),
+        encoding="utf-8")
+
+    app_paths.seed_user_config()
+
+    with open(os.path.join(app_paths.config_dir(), "settings.json"),
+              encoding="utf-8") as f:
+        cfg = json.load(f)
+    assert cfg["last_address"] == ""
+    assert cfg["encoder_counts_per_um"] == 12.8
+
+
+def test_seed_keeps_a_port_this_pc_already_connected_on(frozen):
+    """Only a FRESH seed is blanked; an existing install's own port survives."""
+    import json
+    bundle, _ = frozen
+    (bundle / "config" / "settings.json").write_text(
+        json.dumps({"last_address": "COM4"}), encoding="utf-8")
+    os.makedirs(app_paths.config_dir(), exist_ok=True)
+    live = os.path.join(app_paths.config_dir(), "settings.json")
+    with open(live, "w", encoding="utf-8") as f:
+        json.dump({"last_address": "COM11"}, f)
+
+    app_paths.seed_user_config()
+
+    with open(live, encoding="utf-8") as f:
+        assert json.load(f)["last_address"] == "COM11"

@@ -11,9 +11,9 @@ import os
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QGridLayout,
     QPushButton, QLabel, QStackedWidget, QFrame,
-    QSizePolicy, QStatusBar,
+    QSizePolicy, QStatusBar, QScrollArea, QStyle,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSlot
+from PyQt5.QtCore import Qt, QTimer, pyqtSlot, QSize
 from PyQt5.QtGui import QFont
 from loguru import logger
 
@@ -42,6 +42,34 @@ NAV_ITEMS = [
 ]
 
 
+class _PanelScroll(QScrollArea):
+    """A scroll area that asks for its panel's FULL size.
+
+    A stock QScrollArea caps its size hint at roughly 36x24 lines of text, which
+    would shrink the window that run.py sizes from sizeHint(). This one passes
+    the panel's own hint through, so on a big enough screen the window opens at
+    exactly the size it did before and no scroll bar appears; only when the
+    window is smaller than the panel do the bars show up.
+    """
+
+    def __init__(self, panel: QWidget):
+        super().__init__()
+        self.setWidget(panel)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        # Never take focus: a focused scroll area scrolls on the arrow and page
+        # keys, which belong to keyboard jogging (JogPanel.JOG_KEYS).
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def sizeHint(self) -> QSize:
+        hint = self.widget().sizeHint()
+        bar = self.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        return QSize(hint.width() + bar, hint.height())
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(200, 150)
+
+
 class GalilMainWindow(QMainWindow):
     def __init__(self, controller, use_mock: bool = False):
         super().__init__()
@@ -68,6 +96,9 @@ class GalilMainWindow(QMainWindow):
         if use_mock:
             self.worker.start()
             self._on_worker_started()
+            # No retract check here: the mock's positions are nowhere near the
+            # rig's micron origin, so it would always conclude "retracted" - and
+            # write that into the SAME state file the real app reads.
 
     # ── Layout ──────────────────────────────────────────────────────────────
 
@@ -112,9 +143,12 @@ class GalilMainWindow(QMainWindow):
             self.controller, self.worker)
         self._settings_panel = SettingsPanel(self.settings)
 
+        # Each panel in its own scroll area, so a screen smaller than the jog
+        # panel (a laptop at 125-150 % scaling) scrolls instead of clipping.
+        # Stack indices are unchanged: one wrapper per panel, in order.
         for panel in [self._conn_panel, self._jog_panel, self._log_panel,
                       self._settings_panel]:
-            self._stack.addWidget(panel)
+            self._stack.addWidget(_PanelScroll(panel))
 
         self._nav_buttons[0].click()
 
@@ -126,7 +160,7 @@ class GalilMainWindow(QMainWindow):
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(0)
 
-        logo = QLabel("GALIL\nDMC-4133")
+        logo = QLabel("STORK\nCONTROLLER")
         logo.setFont(QFont("Segoe UI", 11, QFont.Bold))
         logo.setStyleSheet("color: #00C9A7; padding: 16px 12px 8px 12px;")
         logo.setAlignment(Qt.AlignCenter)
@@ -252,6 +286,9 @@ class GalilMainWindow(QMainWindow):
     def _connect_signals(self):
         self.worker.status_updated.connect(self._jog_panel.on_status_updated)
         self.worker.status_updated.connect(self._on_status_sidebar)
+        self.worker.move_progress.connect(self._jog_panel.on_move_progress)
+        self.worker.move_progress.connect(self._on_move_progress_sidebar)
+        self.worker.touch_alarm.connect(self._jog_panel.on_touch_alarm)
         self.worker.error_occurred.connect(self._log_panel.on_error)
 
         self._conn_panel.connected.connect(self._on_connected)
@@ -268,10 +305,17 @@ class GalilMainWindow(QMainWindow):
             if ax in self._sidebar_pos:
                 self._sidebar_pos[ax].setText(f"{s.pos:.0f}")
 
+    @pyqtSlot(str, float)
+    def _on_move_progress_sidebar(self, axis: str, counts: float):
+        if axis in self._sidebar_pos:
+            self._sidebar_pos[axis].setText(f"{counts:.0f}")
+
     @pyqtSlot(object, object)
     def _on_connected(self, controller, worker):
         self._conn_indicator.setText(f"● {controller.info.model}")
         self._conn_indicator.setStyleSheet("color: #3DBA6F;")
+        # The stored retract state is this PC's memory only; ask the encoder.
+        self._jog_panel.check_z_retract()
 
     @pyqtSlot()
     def _on_disconnected(self):

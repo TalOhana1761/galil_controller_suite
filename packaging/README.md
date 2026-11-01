@@ -1,6 +1,6 @@
 # Building the Windows installer
 
-Produces a single `GalilControllerSuite-Setup-<version>.exe`. That one file is
+Produces a single `StorkController-Setup-<version>.exe`. That one file is
 everything a peer needs — it carries the Python interpreter, PyQt5, numpy,
 pydantic, loguru and the gclib DLLs, so **the target machine needs no Python, no
 pip, no venv and no terminal.**
@@ -18,8 +18,8 @@ a working app. Two Start Menu entries are created —
 
 | entry | runs |
 |---|---|
-| Galil Controller Suite | `GalilControllerSuite.exe` (real hardware) |
-| Galil Controller Suite (simulator) | `GalilControllerSuite.exe --mock` |
+| Stork Controller | `StorkController.exe` (real hardware) |
+| Stork Controller (simulator) | `StorkController.exe --mock` |
 
 Plus an uninstaller in Add/Remove Programs.
 
@@ -42,8 +42,8 @@ a controller is plugged in.
 | file | does |
 |---|---|
 | `build_installer.py` | runs all three stages; the only command you need |
-| `make_icon.py` | draws `galil_suite.ico` (tracked, regenerated each build) |
-| `galil_suite.spec` | PyInstaller: what to freeze, bundle and exclude |
+| `make_icon.py` | draws `stork.ico`, a stork head (tracked, regenerated each build; `--png DIR` to preview) |
+| `galil_suite.spec` | PyInstaller: what to freeze, bundle and exclude (file name kept; it builds `StorkController.exe`) |
 | `installer.iss` | Inno Setup: the wizard, shortcuts and uninstaller |
 
 `_dist/`, `_build/` and `_output/` are build artifacts and gitignored.

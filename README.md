@@ -1,6 +1,10 @@
-# Galil Controller Suite
+# Stork Controller (Galil Controller Suite)
 
 PyQt5 GUI for controlling the **Galil DMC-4133** 3-axis servo motor controller used in the Light Injector setup (Axes A, B, C → X, Y, Z).
+
+The manipulator it drives is called **Stork**, so that is the name the operator
+sees: window title, Start menu, installer and icon all say **Stork Controller**.
+Inside the code it is still the Galil Controller Suite.
 
 ---
 
@@ -51,7 +55,7 @@ for why.
 
 **This is the easy way, and what most people want.**
 
-1. Get `GalilControllerSuite-Setup-<version>.exe`.
+1. Get `StorkController-Setup-<version>.exe` (`GalilControllerSuite-Setup-…` before 1.2.0).
 2. Run it. Pick an install folder; tick the desktop shortcut.
 3. Double-click the desktop icon.
 
@@ -64,11 +68,15 @@ Two Start Menu entries are created:
 
 | entry | what it does |
 |---|---|
-| **Galil Controller Suite** | connects to real hardware |
-| **Galil Controller Suite (simulator)** | `--mock`, no hardware needed |
+| **Stork Controller** | connects to real hardware |
+| **Stork Controller (simulator)** | `--mock`, no hardware needed |
+
+Installing 1.2.0 over a 1.1.x install upgrades it in place and replaces the old
+"Galil Controller Suite" shortcuts.
 
 Settings, calibration and logs are kept in
-`%LOCALAPPDATA%\GalilControllerSuite\`, **not** in the install folder — so the
+`%LOCALAPPDATA%\GalilControllerSuite\` (the old name, kept so upgrades keep
+your calibration), **not** in the install folder — so the
 app works correctly when installed under `C:\Program Files\`, and an uninstall
 offers to keep your calibration for a reinstall.
 

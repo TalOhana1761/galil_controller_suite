@@ -23,6 +23,7 @@ from loguru import logger
 from controller.data_models import AxisStatus
 from utils.zero_offsets import ZeroOffsets
 from utils import z_retract_state
+from ui.polling_worker import TOUCH_ALARM_INPUT
 
 # Settle window used for interactive (jog) moves. Imported from the controller so
 # there is one source of truth, but guarded: run.py only imports
@@ -67,14 +68,15 @@ _JOG_HOLD_MS = 150
 #
 # Nothing stops a jog except the poll loop noticing the switch, and that is one
 # cycle (~165 ms) later, so the overshoot is speed x cycle: ~100 um at the 4000
-# counts/s jog default, ~26 um here. It is open loop and past the tape, so that
+# counts/s jog default, ~77 um here. It is open loop and past the tape, so that
 # overshoot cannot be measured or corrected afterwards - only avoided.
 #
-# Raised from 500 to 1000 on 2026-09-24: at 500 the measured retract took 94 s
-# of blind jog, which is a long time to watch. The user accepted the doubled
-# overshoot (13 -> 26 um) for halving that. 1000 counts/s is 156 um/s, so the
-# ~7.4 mm to the switch takes about 47 s.
-BLIND_JOG_SPEED = 1000         # counts/s for both blind phases
+# Raised from 500 to 1000 on 2026-09-24 (94 s of blind jog was too long to
+# watch), then to 3000 on 2026-10-08: the full round trip still took about a
+# minute. The user accepted ~77 um past the switch for it, on the grounds that
+# the retract is still stopped by the switch itself. 3000 counts/s is 469 um/s,
+# so the ~7.4 mm to the switch takes about 16 s.
+BLIND_JOG_SPEED = 3000         # counts/s for both blind phases
 
 # How far a blind jog may run before it is given up on. The switch sits about
 # 7.4 mm past 0 um (measured on the rig, 2026-09-24 - the 100 s that run
@@ -99,6 +101,21 @@ _ENC_ERROR_BIT = 1 << 3
 # INTERMITTENT near the tape end (9 of 75 reads on 2026-09-24), so a single
 # clean read is not evidence the head is back on.
 _ENC_OK_POLLS = 3
+
+# On connect the retract state is CHECKED against the rig, not just loaded from
+# disk: the file is per PC, so a retract done from another laptop is invisible
+# to it (2026-10-08: retracted from a laptop, controller moved to this PC, which
+# offered Retract Z on a head already parked off the tape).
+#
+# The encoder is the evidence. Off the tape the BiSS frame is flagged (error or
+# timeout bit) or decodes to nonsense, so the head counts as ON the tape only if
+# every one of _RZ_CHECK_READS reads is unflagged AND within the tape length of
+# the micron origin. Any doubt lands in OFF_TAPE, the state whose move recovers.
+# Ten reads rather than the insert's three, because a corrupted frame near the
+# tape end passed unflagged on 66 of 75 reads (2026-09-24); the position test
+# is what catches that one - it was 2^23 counts (655 mm) out.
+_ENC_TIMEOUT_BIT = 1 << 0
+_RZ_CHECK_READS = 10
 
 # Retract/insert states. The button is the whole UI for this, so its text says
 # which one is next: "Retract Z" while the head is on the tape, "Insert Z" once
@@ -147,10 +164,16 @@ class JogPanel(QWidget):
                           else _RZ_ON_TAPE)
         self._rz_started = 0.0
         self._rz_enc_ok_count = 0
+        # The on-connect check (check_z_retract): None when not running, else
+        # the per-read verdicts collected so far.
+        self._rz_check: list | None = None
+        self._rz_check_polls = 0
 
         self._build_ui()
         # A restored OFF_TAPE has to reach the Z buttons now, not a poll later.
         self._apply_z_lock()
+        if self._rz_state != _RZ_ON_TAPE and self.worker.soft_limits is not None:
+            self.worker.soft_limits.suspend("C")     # _TP is not a position
         self.worker.jog_button_state.connect(self._on_jog_button_state_changed)
         # A retract/insert is driven by the poll, so a command that RAISES would
         # otherwise leave the button stuck until the blind timeout - three
@@ -463,11 +486,17 @@ class JogPanel(QWidget):
         self._lim_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._lim_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._lim_table.setSelectionMode(QTableWidget.NoSelection)
-        self._lim_table.setMaximumHeight(120)
         for r, ax in enumerate(AXES):
             self._lim_table.setItem(r, 0, QTableWidgetItem(ax))
             for c in range(1, 3):
                 self._lim_table.setItem(r, c, QTableWidgetItem("CLR ●"))
+        # Exactly as tall as its three rows. The old 120 px cap clipped the C
+        # row behind a scrollbar, and anything looser lets the layout squeeze it.
+        self._lim_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._lim_table.setFixedHeight(
+            self._lim_table.horizontalHeader().sizeHint().height()
+            + sum(self._lim_table.rowHeight(r) for r in range(len(AXES)))
+            + 2 * self._lim_table.frameWidth())
         lv.addWidget(self._lim_table)
 
         # Limit alert
@@ -477,6 +506,24 @@ class JogPanel(QWidget):
         self._lim_alert.setVisible(False)
         lv.addWidget(self._lim_alert)
         col.addWidget(lim_grp)
+
+        # Touch alarm. The manipulator hand shorts DI1 to ground when it touches
+        # metal it should not, so the input reads 1 normally and 0 in alarm.
+        # Display only - nothing here stops motion.
+        touch_grp = QGroupBox("Touch Alarm")
+        touch_row = QHBoxLayout(touch_grp)
+        touch_lbl = QLabel("Touch Alarm")
+        touch_lbl.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        touch_lbl.setToolTip(f"Digital input DI{TOUCH_ALARM_INPUT}: reads 1 normally "
+                             f"(pulled up), 0 when the manipulator hand touches "
+                             f"metal. Display only - it does not stop motion.")
+        self._touch_box = QLabel("—", alignment=Qt.AlignCenter)  # type: ignore[call-arg]
+        self._touch_box.setMinimumSize(110, 34)
+        self._set_touch_box(None)
+        touch_row.addWidget(touch_lbl)
+        touch_row.addStretch()
+        touch_row.addWidget(self._touch_box)
+        col.addWidget(touch_grp)
 
         # Homing
         home_grp = QGroupBox("Homing")
@@ -507,6 +554,9 @@ class JogPanel(QWidget):
         mem_grp = QGroupBox("Position Memory")
         mv = QVBoxLayout(mem_grp)
         self._mem_list = QListWidget()
+        # The window opens at its content's size, so give the list its height
+        # explicitly - otherwise it shrinks to its hint and scrolls at 3 slots.
+        self._mem_list.setMinimumHeight(120)
         self._mem_list.setMaximumHeight(140)
         mv.addWidget(self._mem_list)
         btn_row = QHBoxLayout()
@@ -641,6 +691,14 @@ class JogPanel(QWidget):
         self._rz_state = state
         self._refresh_rz_button()
         self._apply_z_lock()
+        # Soft limits follow the same line: off the tape _TP is garbage and a
+        # bound evaluated against it fires on nonsense - which is how a parked
+        # head came to show BOTH Z limits at once.
+        if self.worker.soft_limits is not None:
+            if state == _RZ_ON_TAPE:
+                self.worker.soft_limits.resume("C")
+            else:
+                self.worker.soft_limits.suspend("C")
         z_retract_state.save(z_retract_state.ON_TAPE if state == _RZ_ON_TAPE
                              else z_retract_state.OFF_TAPE)
 
@@ -659,7 +717,10 @@ class JogPanel(QWidget):
             tip = (f"Jog Z back at {BLIND_JOG_SPEED} counts/s until the encoder "
                    f"reads valid again - back on the tape, at about 0 um.")
         self._btn_rz.setStyleSheet(f"color: {colour}; font-weight: bold;")
-        self._btn_rz.setEnabled(not busy)
+        self._btn_rz.setEnabled(not busy and self._rz_check is None
+                                and self._z_motor_enabled())
+        if not busy and not self._z_motor_enabled():
+            tip += chr(10) * 2 + "Disabled: press Enable Motors first."
         self._btn_rz.setToolTip(tip)
 
     def _confirm(self, title: str, question: str) -> bool:
@@ -675,7 +736,21 @@ class JogPanel(QWidget):
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No) == QMessageBox.Yes
 
+    def _z_motor_enabled(self) -> bool:
+        """Has Enable Motors armed C in this session?
+
+        A retract or insert queued with C off moves nothing, but the button
+        used to flip regardless and record a state that was not true. Read from
+        the controller's own record of what enable_axes() did, not polled, so it
+        costs no round trip.
+        """
+        return "C" in getattr(self.controller, "enabled_axes", ())
+
     def _on_retract_clicked(self):
+        if not self._z_motor_enabled():
+            logger.warning("Retract/Insert Z refused: Z motor is not enabled")
+            self._refresh_rz_button()
+            return
         # Both prompts are idiot-proofing on a move that cannot be undone by
         # looking at the encoder afterwards: once the head is off the tape there
         # is no reading to tell you where it went.
@@ -725,10 +800,39 @@ class JogPanel(QWidget):
         One queued command for both, so the blind jog cannot begin before the
         axis has arrived. It RETURNS with the jog running - the poll loop is
         what watches for the switch and halts it.
+
+        The blind clock is restarted HERE, once the jog is running. It used to
+        run from the button press, so the closed-loop approach counted as blind
+        travel: from +40 mm the approach took 51.6 s, longer than the whole
+        ~22 s blind allowance, and the retract aborted 0.1 s into the jog
+        (2026-10-08). Safe to write from this thread - the GUI only reads it in
+        _rz_tick(), on a poll, and no poll runs until this returns.
         """
         self.controller.move_to_counts("C", target_counts,
                                        settle_window_ms=JOG_SETTLE_WINDOW_MS)
         self.controller.jog("C", to_controller("C", -1) * BLIND_JOG_SPEED)
+        self._rz_started = time.monotonic()
+
+    def _insert_return_sequence(self, target_counts: float):
+        """Runs ON THE WORKER THREAD: stop the blind jog, then close the loop on 0 um.
+
+        The jog stops wherever the encoder first reads valid again, which is
+        not a fixed place - it depends on where the tape's good region starts
+        and on ~3 poll cycles of further travel. Finishing at the micron origin
+        makes every insert end at the same spot, the spot the retract left from.
+
+        One queued command for both, so the closed-loop move cannot start while
+        the jog is still running. move_to_counts() waits for the axis to stand
+        still before it reads _TP. An origin of 0 has never been set (an
+        absolute encoder never reads 0 on this rig), so it only halts.
+        """
+        self.controller.halt_axis("C")
+        if target_counts == 0.0:
+            logger.warning("Insert Z: no micron origin for C, stopping where "
+                           "the tape was found")
+            return
+        self.controller.move_to_counts("C", target_counts,
+                                       settle_window_ms=JOG_SETTLE_WINDOW_MS)
 
     def _start_insert(self):
         if self.worker.soft_limits is not None:
@@ -763,7 +867,7 @@ class JogPanel(QWidget):
         self.worker.watch_encoder.discard("C")
         self._set_rz_state(state)     # hands Z back only when state is ON_TAPE
         self._rz_note.setText(note)
-        level(f"Z {note} after {elapsed:.1f} s of blind jog "
+        level(f"Retract/insert: {note} after {elapsed:.1f} s of blind jog "
               f"(about {travel_um:.0f} um at {BLIND_JOG_SPEED} counts/s)")
         if state == _RZ_ON_TAPE and self.worker.soft_limits is not None:
             self.worker.soft_limits.resume("C")      # _TP is trustworthy again
@@ -772,11 +876,13 @@ class JogPanel(QWidget):
         self.worker.clear_queue()
         self.worker.queue_command(self.controller.halt_axis, "C")
         logger.error(f"Z retract/insert aborted: {why}")
-        # An aborted RETRACT leaves the head somewhere unknown, possibly off the
-        # tape, so it lands in OFF_TAPE - the state whose button offers the move
-        # that brings it back.
-        state = _RZ_ON_TAPE if self._rz_state == _RZ_INSERTING else _RZ_OFF_TAPE
-        self._rz_finish(state, f"stopped: {why}", level=logger.error)
+        # An aborted retract OR insert leaves the head somewhere unknown, so it
+        # lands in OFF_TAPE - the state whose button offers the recovering move -
+        # and then asks the encoder, which corrects it if the head is on the
+        # tape after all. Guessing from which move was running is how the state
+        # came to say inserted while the head was retracted, or the reverse.
+        self._rz_finish(_RZ_OFF_TAPE, f"stopped: {why}", level=logger.error)
+        self.check_z_retract()
 
     def _on_worker_error(self, message: str):
         if self._rz_state in (_RZ_RETRACTING, _RZ_INSERTING):
@@ -790,6 +896,12 @@ class JogPanel(QWidget):
         if s is None:
             return
 
+        if not self._z_motor_enabled():
+            # E-STOP or Disable Motors mid-sequence: nothing is moving any more,
+            # so waiting for the switch or the tape would only end in a timeout.
+            self._rz_abort("Z motor disabled")
+            return
+
         if time.monotonic() - self._rz_started > self._blind_timeout_s():
             self._rz_abort(f"no end within {BLIND_MAX_TRAVEL_UM / 1000:.1f} mm")
             return
@@ -798,7 +910,7 @@ class JogPanel(QWidget):
             # The limit in the direction being driven. _guard_jog_limits has
             # already issued the halt by the time the flag reaches us.
             if self._direction_blocked("C", -1):
-                self._rz_finish(_RZ_OFF_TAPE, "retracted to the limit switch")
+                self._rz_finish(_RZ_OFF_TAPE, "Z Retracted")
             return
 
         # Inserting: wait for the encoder to call its own data valid, and to
@@ -807,14 +919,106 @@ class JogPanel(QWidget):
         # evidence that the head is back on.
         if s.enc_status is None:
             return
-        if s.enc_status & _ENC_ERROR_BIT:
+        if s.enc_status & (_ENC_ERROR_BIT | _ENC_TIMEOUT_BIT):
             self._rz_enc_ok_count = 0
             return
         self._rz_enc_ok_count += 1
         if self._rz_enc_ok_count >= _ENC_OK_POLLS:
             self.worker.clear_queue()
-            self.worker.queue_command(self.controller.halt_axis, "C")
-            self._rz_finish(_RZ_ON_TAPE, "back on the tape")
+            self.worker.queue_command(self._insert_return_sequence,
+                                      self.zeros.get_um_origin("C"))
+            self._rz_finish(_RZ_ON_TAPE, "Z Inserted")
+
+    # ---- Retract state, checked against the rig on connect ----
+
+    def check_z_retract(self):
+        """Start asking the encoder whether the Z head is on the tape.
+
+        Called on every connect. The stored state is only this PC's memory of
+        what IT did, so it is wrong whenever the rig was driven from elsewhere.
+        Z's controls and the retract button stay locked until the answer is in,
+        ~_RZ_CHECK_READS poll cycles (a couple of seconds).
+        """
+        if self._rz_state in (_RZ_RETRACTING, _RZ_INSERTING):
+            return                      # mid-sequence: it is already watching
+        self._rz_check = []
+        self._rz_check_polls = 0
+        self.worker.watch_encoder.add("C")
+        if self.worker.soft_limits is not None:
+            self.worker.soft_limits.suspend("C")     # until _TP is known good
+        self._rz_note.setText("checking whether Z is retracted...")
+        self._refresh_rz_button()
+        self._apply_z_lock()
+
+    def _enc_read_valid(self, s) -> bool:
+        """One poll's verdict: is this a real on-tape position?"""
+        if s.enc_status & (_ENC_ERROR_BIT | _ENC_TIMEOUT_BIT):
+            return False
+        origin = self.zeros.get_um_origin("C")
+        if origin == 0.0:
+            return True                 # no origin: the flag bits are all we have
+        span = (self.settings.axis_c.encoder_length_mm * 1000.0
+                * self.settings.encoder_counts_per_um)
+        return abs(s.pos - origin) <= span
+
+    def _rz_check_tick(self, status: dict):
+        if self._rz_check is None:
+            return
+        s = status.get("C")
+        if s is None:
+            return
+        self._rz_check_polls += 1
+        if s.enc_status is not None:
+            self._rz_check.append(self._enc_read_valid(s))
+        elif self._rz_check_polls < 3 * _RZ_CHECK_READS:
+            return                      # not read this cycle; wait for one that is
+        else:
+            self._rz_check.append(False)   # unreadable: assume the worst
+        if len(self._rz_check) < _RZ_CHECK_READS:
+            return
+
+        bad = self._rz_check.count(False)
+        self._rz_check = None
+        self.worker.watch_encoder.discard("C")
+        stored = self._rz_state
+        switch = bool(s.fwd_limit or s.rev_limit)   # soft limits are suspended
+        if bad:
+            state, note = _RZ_OFF_TAPE, "Z is retracted (encoder off the tape)"
+            # The switch is the retract end, whatever this PC last commanded -
+            # otherwise a stale last_direction labels it the wrong end and
+            # refuses the very jog that inserts.
+            self.worker.queue_command(self.controller.declare_limit_end, "C",
+                                      to_controller("C", -1))
+        else:
+            state, note = _RZ_ON_TAPE, ""
+        detail = (f"{bad}/{_RZ_CHECK_READS} encoder reads invalid, limit switch "
+                  f"{'pressed' if switch else 'clear'}, _TPC={s.pos:.0f}")
+        if state != stored:
+            logger.warning(f"Z retract check: stored state was {stored} but the "
+                           f"rig says {state} ({detail}) - going with the rig")
+        else:
+            logger.info(f"Z retract check: {state} ({detail})")
+        self._set_rz_state(state)
+        self._rz_note.setText(note)
+
+    # ── Touch alarm ──────────────────────────────────────────────────────────
+
+    def _set_touch_box(self, active):
+        """active: True = alarm (DI1 reads 0), False = clear, None = unknown."""
+        if active is None:
+            text, bg = "—", "#30363D"
+        elif active:
+            text, bg = "On", "#C62828"
+        else:
+            text, bg = "Off", "#2E7D32"
+        self._touch_box.setText(text)
+        self._touch_box.setStyleSheet(
+            f"background-color: {bg}; color: white; font-weight: bold; "
+            f"border-radius: 5px; padding: 6px 14px; font-size: 12pt;")
+
+    @pyqtSlot(object)
+    def on_touch_alarm(self, active):
+        self._set_touch_box(active)
 
     # ── Limit blocking ───────────────────────────────────────────────────────
 
@@ -850,7 +1054,8 @@ class JogPanel(QWidget):
         on and a jog would run blind with the soft limits suspended. The only Z
         motion that makes sense in between is the retract/insert button itself.
         """
-        return axis == "C" and self._rz_state != _RZ_ON_TAPE
+        return axis == "C" and (self._rz_state != _RZ_ON_TAPE
+                                or self._rz_check is not None)
 
     def _direction_allowed(self, axis: str, sign: int) -> bool:
         """May the operator command `sign` on `axis` right now?
@@ -964,12 +1169,50 @@ class JogPanel(QWidget):
             return
         self._set_direction_enabled(axis, sign, enabled)
 
+    def _show_position(self, ax: str, counts: float):
+        """Paint one axis's position readouts from a raw _TP reading."""
+        # Remember what the counts column was built from, so ZERO zeroes THAT
+        # and not some other reading of the position.
+        self._raw_counts[ax] = counts
+
+        # Two independent origins, on purpose:
+        #   counts  - the ZERO buttons, a working zero re-set at will
+        #   microns - the rig's true zero, set once and left alone
+        # so that re-zeroing the counts mid-job cannot silently move what
+        # the micron reading means.
+        # Both columns are signed distances FROM an origin, so they carry a
+        # direction and are shown in stage terms. The origins themselves stay
+        # raw _TP; only the difference is flipped. Without this the number
+        # would count DOWN while the Y+ button drove the stage up.
+        zeroed = to_stage(ax, self.zeros.apply(ax, counts))
+        um = counts_to_um(to_stage(ax, self.zeros.apply_um(ax, counts)),
+                          self.settings.encoder_counts_per_um)
+        if ax in self._pos_lbls:
+            self._pos_lbls[ax].setText(f"{zeroed:.1f}")
+            self._pos_um_lbls[ax].setText(f"{um:.3f}")
+        if ax == "C":
+            self._z_pos_lbl.setText(f"{zeroed:.1f}")
+            self._z_pos_um_lbl.setText(f"{um:.3f}")
+
+    @pyqtSlot(str, float)
+    def on_move_progress(self, axis: str, counts: float):
+        """A position read mid-move, while the poll is blocked behind it.
+
+        Position ONLY. The limit table, the button enable state and the Z
+        retract state machine all wait for the next real poll: this reading
+        carries no limit flags, and treating it as a poll would re-enable
+        buttons on flags that were never read.
+        """
+        self._show_position(axis, counts)
+
     @pyqtSlot(dict)
     def on_status_updated(self, status: dict):
         self._current_status = status
         # Before the display: a retract/insert in progress decides here whether
         # it has finished, and _direction_blocked() below reads the same flags.
+        self._rz_check_tick(status)
         self._rz_tick(status)
+        self._refresh_rz_button()       # follows Enable/Disable Motors
 
         # Positions come from the poll signal, not from config/last_positions.json.
         # The file is rewritten by poll_all_axes() every cycle, so reading it here
@@ -977,29 +1220,7 @@ class JogPanel(QWidget):
         # cycle behind, and in mock mode it showed whatever the last hardware
         # session left behind instead of the simulated stage.
         for ax, s in status.items():
-            counts = s.pos
-            # Remember what the counts column was built from, so ZERO zeroes THAT
-            # and not some other reading of the position.
-            self._raw_counts[ax] = counts
-
-            # Two independent origins, on purpose:
-            #   counts  - the ZERO buttons, a working zero re-set at will
-            #   microns - the rig's true zero, set once and left alone
-            # so that re-zeroing the counts mid-job cannot silently move what
-            # the micron reading means.
-            # Both columns are signed distances FROM an origin, so they carry a
-            # direction and are shown in stage terms. The origins themselves stay
-            # raw _TP; only the difference is flipped. Without this the number
-            # would count DOWN while the Y+ button drove the stage up.
-            zeroed = to_stage(ax, self.zeros.apply(ax, counts))
-            um = counts_to_um(to_stage(ax, self.zeros.apply_um(ax, counts)),
-                              self.settings.encoder_counts_per_um)
-            if ax in self._pos_lbls:
-                self._pos_lbls[ax].setText(f"{zeroed:.1f}")
-                self._pos_um_lbls[ax].setText(f"{um:.3f}")
-            if ax == "C":
-                self._z_pos_lbl.setText(f"{zeroed:.1f}")
-                self._z_pos_um_lbl.setText(f"{um:.3f}")
+            self._show_position(ax, s.pos)
 
         def _cell(active: bool) -> QTableWidgetItem:
             item = QTableWidgetItem("HIT ●" if active else "CLR ●")

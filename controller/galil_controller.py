@@ -206,7 +206,8 @@ BISS_CONFIG = "1,33,0,0<9"
 # its own either - so it has NO end-stop protection beyond the AXIS_TRAVEL_MM
 # guard in _move_microns().
 LIMIT_INPUT = {
-    "B": "FWD",          # NC switch on B's forward DMC input, wired 2026-09-24
+    "A": "FWD",          # NC switch on A's forward DMC input, wired 2026-10-12
+    "B": "FWD",         # NC switch on B's forward DMC input, wired 2026-09-24
     "C": "FWD",          # NC switch on C's forward DMC input, wired 2026-09-24
 }
 
@@ -225,6 +226,22 @@ LIMIT_INPUT = {
 # closed loop correct against a stale reading and overshoot, so 2 it is. Going
 # lower buys little and risks exciting the drive.
 KS_SMOOTHING = 2
+
+# Drive current per axis, as the SDM-44140's AG setting (2026-11-01). AG is amps
+# per phase, NOT a resolution gain: n = 0/1/2/3 -> 0.5/1.0/2.0/3.0 A (box manual
+# A10, Table A9.4). Matched to the motor datasheets:
+#
+#     X (A), Y (B)   1 A motors   AG=1 -> 1.0 A
+#     Z (C)          3 A motor    AG=3 -> 3.0 A
+#
+# Nothing set AG before this, so every axis ran on the EEPROM value, read as AG=1
+# on 2026-09-23 - which left Z at a third of its rated current. The earlier
+# analysis had assumed one 1.2 A motor on all three axes.
+#
+# LC is still not set, so holding current stays at the EEPROM's LC=0: 25% after a
+# move, i.e. 0.75 A on Z at rest instead of 0.25 A. Expect Z to run warmer.
+# AG needs the axis in MO, which enable_axes() guarantees by sending MO first.
+AXIS_AMP_GAIN = {"A": 1, "B": 1, "C": 3}
 
 # Speed for the final approach, in motor counts/s. The sweep on axis C measured
 # SP=500 as giving both the tightest spread on a 10 um step (0.70 um against
@@ -248,6 +265,11 @@ FINE_BELOW_UM = 5.0   # remaining error under this switches to FINE_SPEED
 # after a 10 um step). Waiting is not a cure for it, which is precisely why
 # interactive moves should not pay for a long wait.
 JOG_SETTLE_WINDOW_MS = 60
+
+# How often a running closed-loop move reports its position to the UI, in s.
+# Matches the poll's own POLL_MS, so the readout moves at the same rate during a
+# step move as it does during a jog. See GalilController.position_listener.
+PROGRESS_INTERVAL_S = 0.1
 
 # ── Post-move relaxation ────────────────────────────────────────────────────
 # Measured on axis C, 2026-09-22, watching _TP for 10 s after a move with the
@@ -289,6 +311,26 @@ class GalilController:
         # Direction of an active continuous jog per axis, 0 when not jogging.
         # Software-tracked so the poll loop can stop a jog that reaches a limit.
         self._jogging: dict[str, int] = {ax: 0 for ax in AXES}
+        # Called as listener(axis, counts) with every _TP reading taken while a
+        # closed-loop move runs. A move blocks the polling thread for its whole
+        # duration, so without this the display freezes until it ends. None (the
+        # default, and what the hardware scripts get) also skips the extra _TP
+        # reads _wait_motion() makes for it, so their timing is unchanged.
+        self.position_listener = None
+        # Called with no arguments on the same throttled cadence, from inside a
+        # move, on the thread running it - so it may issue its own commands. The
+        # polling worker hangs its touch alarm read here, because the move holds
+        # off the poll that would otherwise do it. None = nothing extra is read.
+        self.motion_tick = None
+        self._last_progress = 0.0
+        # Axes enable_axes() has configured and armed IN THIS SESSION. Not read
+        # from the controller: what matters is that this session ran the full
+        # configuration (CN/LD/SS/...), and a motor left on by another PC has not
+        # had that. Cleared by disable_axes(), emergency_stop() and (dis)connect.
+        # The Z retract button keys off it - a retract queued with C off moves
+        # nothing, but the button used to flip anyway and record a state that
+        # was not true.
+        self.enabled_axes: set = set()
 
     # ── Connection ─────────────────────────────────────────────────────────
 
@@ -305,7 +347,8 @@ class GalilController:
         if SERIAL_BAUD and "--baud" not in address and not address[0].isdigit():
             address = f"{address} --baud {SERIAL_BAUD}"
             logger.info(f"Opening with an explicit baud: {address}")
-        self._g.GOpen(address)
+        address = self._open(address)
+        self.enabled_axes = set()
         gi = self._g.GInfo()
         parts = [p.strip() for p in gi.split(",")]
         model_rev = parts[1].split(" Rev ") if len(parts) >= 2 else ["", ""]
@@ -325,6 +368,38 @@ class GalilController:
         logger.info(f"Connected: {gi}")
         return self.info
 
+    def _open(self, address: str) -> str:
+        """GOpen, retrying a failed SERIAL open as a direct connection.
+
+        gclib routes every open through Galil's gcaps service when one is
+        installed, and only goes direct when none is. This PC has gcaps and it
+        works; a peer's laptop could not open a port that was plainly present
+        (2026-10-08), and a stale or mismatched gcaps from an older Galil install
+        there is one way that happens. `--direct` takes gcaps out of the path.
+
+        Serial only: over Ethernet, gcaps is what shares the controller's few
+        handles between programs, so bypassing it is not a harmless retry.
+        Returns the address that actually opened, so reconnect() reuses it.
+        """
+        try:
+            self._g.GOpen(address)
+            return address
+        except Exception as first:
+            tokens = address.split()
+            serial = bool(tokens) and tokens[0].upper().startswith("COM")
+            if not serial or "-d" in tokens or "--direct" in tokens:
+                raise
+            direct = f"{address} --direct"
+            logger.warning(f"Open {address} failed ({first}); retrying as {direct}")
+            try:
+                self._g.GOpen(direct)
+            except Exception as second:
+                raise RuntimeError(
+                    f"{first} (also failed with --direct: {second})") from second
+            logger.warning(f"Opened {direct}: the gcaps route failed and the "
+                           f"direct one works on this PC")
+            return direct
+
     def disconnect(self):
         try:
             self._g.GCommand("ST")
@@ -332,6 +407,7 @@ class GalilController:
             self._g.GClose()
         except Exception as e:
             logger.warning(f"Disconnect: {e}")
+        self.enabled_axes = set()
         self.info.connected = False
         logger.info("Disconnected")
 
@@ -447,6 +523,7 @@ class GalilController:
     #   200 steps/rev (1.8 deg) x 64 microsteps x 1 (gear) / 2000 um pitch = 6.4
     def enable_axes(self, axes: str = "ABC"):
         self.send(f"MO{axes}")  # axes must be off before MT/SY/SS can be changed
+        self.enabled_axes -= set(axes)       # and stay "off" unless all of it lands
 
         # Limit inputs active HIGH, for the NORMALLY CLOSED switches this rig
         # uses - see LIMIT_INPUT. CN is GLOBAL, one setting for all six inputs
@@ -462,6 +539,7 @@ class GalilController:
         for ax in axes:
             logger.info(f"Enable {ax}")
             self.send(f"MT{ax}=2")            # stepper, active-low step pulses (set before SS)
+            self.send(f"AG{ax}={AXIS_AMP_GAIN[ax]}")  # drive current; see AXIS_AMP_GAIN
             self.send(f"SY{ax}=0")            # BiSS WARN/ERROR bits: active low
             self.send(f"SS{ax}={BISS_CONFIG}")  # BiSS -> _TP{ax}; see BISS_CONFIG note above
             self.send(f"YA{ax}=64")           # declare the drive's microstepping; see note below
@@ -473,9 +551,11 @@ class GalilController:
             self.send(f"AC{ax}={AXIS_ACCEL[ax]}")
             self.send(f"DC{ax}={AXIS_DECEL[ax]}")
         self.send(f'SH{axes}')
+        self.enabled_axes |= set(axes)
         logger.info(f"Enable {axes} as steppers with BiSS C encoder feedback")
 
     def disable_axes(self, axes: str = "ABC"):
+        self.enabled_axes -= set(axes)
         self.send(f"MO{axes}")
         logger.info(f"Disable {axes}")
 
@@ -529,6 +609,7 @@ class GalilController:
     stop_all  = halt_all
 
     def emergency_stop(self):
+        self.enabled_axes = set()
         try:
             self._g.GCommand("AB")
             self._g.GCommand("MO")
@@ -608,7 +689,42 @@ class GalilController:
 
     def _read_tp(self, axis: str) -> float:
         """Current encoder reading for one axis, in encoder counts."""
-        return float(self._g.GCommand(f"MG _TP{axis}").strip())
+        tp = float(self._g.GCommand(f"MG _TP{axis}").strip())
+        # Throttled: _wait_until_still() reads every ~16 ms, far more often
+        # than a readout needs repainting.
+        if self._progress_due():
+            self._progress(axis, tp)
+        return tp
+
+    def _progress(self, axis: str, counts: float):
+        """Run the mid-move hooks. Neither is allowed to break the move."""
+        self._last_progress = time.perf_counter()
+        listener = getattr(self, "position_listener", None)
+        if listener is not None:
+            try:
+                listener(axis, counts)
+            except Exception as e:
+                logger.debug(f"{axis}: position listener raised: {e}")
+        tick = getattr(self, "motion_tick", None)
+        if tick is not None:
+            try:
+                tick()
+            except Exception as e:
+                logger.debug(f"{axis}: motion tick raised: {e}")
+
+    def _progress_due(self) -> bool:
+        """Are the mid-move hooks owed a call?
+
+        _wait_motion() reads only _BG and the switch, so a long bulk step would
+        otherwise show nothing until it ended. One _TP read per PROGRESS_INTERVAL_S
+        costs one round trip (~16 ms) every few polls, plus whatever motion_tick
+        reads (the touch alarm: one more) - the limit watch reacts that much
+        later on those polls only.
+        """
+        hooked = (getattr(self, "position_listener", None) is not None
+                  or getattr(self, "motion_tick", None) is not None)
+        return (hooked and
+                time.perf_counter() - self._last_progress >= PROGRESS_INTERVAL_S)
 
     def _wait_motion(self, axis: str, watch_limit: bool,
                      timeout_s: float = 30.0) -> bool:
@@ -648,6 +764,9 @@ class GalilController:
             if not moving:
                 return False
 
+            if self._progress_due():
+                self._read_tp(axis)
+
             if time.perf_counter() - t0 > timeout_s:
                 self._g.GCommand(f"ST{axis}")
                 logger.error(f"{axis}: motion did not complete in {timeout_s:.0f} s; stopped")
@@ -664,6 +783,14 @@ class GalilController:
         poll cycle is what sets the jog overshoot. Read it when it matters.
         """
         return int(self._read_float(f"MG _SS{axis.upper()}0"))
+
+    def digital_input(self, n: int) -> int:
+        """@IN[n], a general digital input: 1 or 0, as the controller reports it.
+
+        Optoisolated and active low: 0 means current is flowing through the
+        input, i.e. it has been pulled to the other side of INCOM.
+        """
+        return int(self._read_float(f"MG @IN[{int(n)}]"))
 
     def limit_tripped(self, axis: str) -> bool:
         """Is this axis's ONE switch pressed? Says nothing about WHICH end.
@@ -705,6 +832,29 @@ class GalilController:
         else:
             self._limit_trip_dir[axis] = 0
         return tripped
+
+    def declare_limit_end(self, axis: str, direction: int):
+        """Say which END the axis is at, from evidence other than this session.
+
+        The switch cannot say which end it is, and the latch in limit_tripped()
+        only knows the direction travelled IN THIS PROCESS. After a restart - or
+        on a different PC, whose last_direction.json says nothing about what the
+        rig did elsewhere - a switch that was already pressed gets labelled from
+        a stale guess, and the wrong label blocks the one direction that escapes.
+
+        The Z retract check uses this once it has established, from the encoder,
+        that the head is parked off the tape: that end is the retract direction.
+        `direction` is in CONTROLLER terms. If the switch is not pressed the
+        latch clears itself on the next read, leaving only the direction.
+        """
+        axis = axis.upper()
+        direction = +1 if direction > 0 else -1
+        self._last_dir[axis] = direction
+        self._limit_trip_dir[axis] = direction
+        if last_dir.get(axis) != direction:
+            last_dir[axis] = direction
+            save_last_dir()
+        logger.info(f"{axis}: limit end declared {'+' if direction > 0 else '-'}")
 
     def limit_active(self, axis: str, direction: int) -> bool:
         """Is the end stop at `direction` on `axis` active?

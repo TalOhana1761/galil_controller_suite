@@ -15,10 +15,22 @@ from loguru import logger
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
+# The digital input the touch alarm is wired to: DI1, pin 2 of the 44-pin I/O
+# connector. Pulled up, so 1 = clear and 0 = the manipulator hand touched metal.
+TOUCH_ALARM_INPUT = 1
+
+
 class PollingWorker(QThread):
     status_updated = pyqtSignal(dict)    # {axis: AxisStatus}
     error_occurred = pyqtSignal(str)
     jog_button_state = pyqtSignal(str, str, bool)  # axis, direction (+/-), enabled
+    # Touch alarm: True = in alarm, False = clear, None = could not be read.
+    touch_alarm = pyqtSignal(object)
+    # axis, raw _TP: a position read INSIDE a blocking closed-loop move. The move
+    # runs on this thread, so status_updated is silent until it returns; this is
+    # what keeps the readout moving meanwhile. Position only - limit flags are
+    # not re-read, so it must not be treated as a poll.
+    move_progress = pyqtSignal(str, float)
 
     POLL_MS = 100
 
@@ -31,6 +43,18 @@ class PollingWorker(QThread):
     def __init__(self, controller, soft_limits=None):
         super().__init__()
         self.controller = controller
+        # Emitting from this thread is safe: Qt queues it to the GUI thread.
+        # The mock has no such hook (its moves land instantly), hence hasattr.
+        if hasattr(controller, "position_listener"):
+            controller.position_listener = self.move_progress.emit
+        # The touch alarm, read from INSIDE a blocking move as well as by the
+        # poll, so it does not go stale for the length of a HOME or GO TO. Same
+        # method, so the same signal, the same log-on-change and the same
+        # failed-read-is-unknown rule. It only reports: what a touch should DO
+        # has not been decided, and when it is, _poll_touch_alarm() is where both
+        # paths meet.
+        if hasattr(controller, "motion_tick"):
+            controller.motion_tick = self._poll_touch_alarm
         # utils.soft_limits.SoftLimits, or None for no software bounds. Applied
         # to the poll result BEFORE it is emitted or guarded, so a soft limit is
         # indistinguishable from a switch to everything downstream - buttons,
@@ -41,6 +65,11 @@ class PollingWorker(QThread):
         # cycle length is what sets the jog overshoot. The Z retract/insert adds
         # "C" while it needs to know whether the head is back on the tape.
         self.watch_encoder: set = set()
+        # Digital input the touch alarm is wired to, or None to not read it. One
+        # extra round trip per cycle (~16 ms), which lengthens the cycle and so
+        # the jog overshoot by the same fraction.
+        self.touch_alarm_input = TOUCH_ALARM_INPUT
+        self._touch_prev = None
         self.cmd_queue  = Queue()
         self._running   = True
         self._consecutive_faults = 0
@@ -78,6 +107,7 @@ class PollingWorker(QThread):
                 if self.soft_limits is not None:
                     status = self.soft_limits.apply(status)
                 self.status_updated.emit(status)
+                self._poll_touch_alarm()
                 self._consecutive_faults = 0
                 self._reconnect_attempts = 0
                 self._guard_jog_limits(status)
@@ -101,6 +131,29 @@ class PollingWorker(QThread):
                 self._note_fault(e)
 
             self.msleep(self.POLL_MS)
+
+    def _poll_touch_alarm(self):
+        """Read the touch alarm input and emit it; log only on a change.
+
+        Pulled up, so 1 is clear and 0 is the alarm. A read failure reports None
+        rather than a guess - "unknown" must not display as "Off".
+        """
+        n = self.touch_alarm_input
+        if n is None or not hasattr(self.controller, "digital_input"):
+            return
+        try:
+            active = self.controller.digital_input(n) == 0
+        except Exception as e:
+            if self._touch_prev is not None:
+                logger.warning(f"Touch alarm (DI{n}) could not be read: {e}")
+            active = None
+        if active != self._touch_prev:
+            if active:
+                logger.warning(f"TOUCH ALARM ON (DI{n} = 0): the manipulator hand is touching metal")
+            elif active is False and self._touch_prev:
+                logger.info(f"Touch alarm cleared (DI{n} = 1)")
+            self._touch_prev = active
+        self.touch_alarm.emit(active)
 
     # ── Jog safety ───────────────────────────────────────────────────────────
 

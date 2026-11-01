@@ -236,8 +236,8 @@ def hw(tmp_path):
     gc.LAST_DIR_PATH = str(tmp_path / "last_direction.json")
     # Give the FAKE rig a switch on every axis. These tests exercise the limit
     # GUARD, not which switches happen to be bolted to the real stage this week,
-    # and gc.LIMIT_INPUT holds the latter - as of 2026-09-24 only C - so without
-    # this every limit test here would pass vacuously on axis A.
+    # and gc.LIMIT_INPUT holds the latter - all three since 2026-10-12, but it
+    # has changed before - so without this a limit test could pass vacuously.
     original_wired = gc.LIMIT_INPUT
     gc.LIMIT_INPUT = {ax: "FWD" for ax in ("A", "B", "C")}
     c = gc.GalilController()
@@ -591,3 +591,71 @@ def test_mock_has_the_same_entry_points():
     for name in ("verify", "undershoot_um", "relax_s"):
         assert name in inspect.signature(MockGalilController.move_to_counts).parameters
         assert name in inspect.signature(GalilController.move_to_counts).parameters
+
+
+# ── Live position during a blocking move ────────────────────────────────────
+
+def test_hw_reports_position_while_the_axis_is_still_moving(hw, monkeypatch):
+    """A move blocks the polling thread, so the display used to freeze until it
+    ended. position_listener must see readings from INSIDE a step, not only the
+    settled ones after it."""
+    import controller.galil_controller as gc
+    monkeypatch.setattr(gc, "PROGRESS_INTERVAL_S", 0.0)   # the fake is instant
+    seen = []
+    hw.position_listener = lambda ax, counts: seen.append((ax, counts))
+    hw._g.poll_steps = 8
+    hw.move_microns("A", 100.0)                           # 1280 encoder counts
+
+    assert seen and all(ax == "A" for ax, _ in seen)
+    # A reading strictly between start and the end of the first bulk step
+    # (0.9 x 1280) can only have been taken mid-step.
+    assert any(0.0 < c < 0.9 * 1280 - 1 for _, c in seen), seen
+
+
+def test_hw_without_a_listener_issues_no_extra_reads(hw, monkeypatch):
+    """Hardware scripts install no listener; their command stream - and so their
+    timing - must be exactly what it was."""
+    import controller.galil_controller as gc
+    monkeypatch.setattr(gc, "PROGRESS_INTERVAL_S", 0.0)
+    hw._g.poll_steps = 8
+    hw.move_microns("A", 100.0)
+    without = list(hw._g.commands)
+
+    hw2 = gc.GalilController()
+    hw2._g = FakeGalil()
+    hw2._g.poll_steps = 8
+    hw2.position_listener = lambda ax, counts: None
+    hw2.move_microns("A", 100.0)
+    # Count only _TP reads taken WHILE MOVING, i.e. followed by another _BG
+    # poll. Total _TP counts are timing-dependent - _wait_until_still() reads for
+    # as long as its window lasts - which made a plain total flaky. One such pair
+    # exists either way: the start-of-move limit check reads _BG after _TP.
+    def mid_motion_tp_reads(cmds):
+        return sum(1 for a, b in zip(cmds, cmds[1:])
+                   if a == "MG _TPA" and b == "MG _BGA")
+    assert mid_motion_tp_reads(without) == 1
+    assert mid_motion_tp_reads(hw2._g.commands) > 1
+
+
+def test_a_listener_that_raises_does_not_break_the_move(hw, monkeypatch):
+    import controller.galil_controller as gc
+    monkeypatch.setattr(gc, "PROGRESS_INTERVAL_S", 0.0)
+
+    def broken(ax, counts):
+        raise RuntimeError("display gone")
+    hw.position_listener = broken
+    moved = hw.move_microns("A", 10.0)
+    assert moved == pytest.approx(10.0, abs=1.0 / gc.ENCODER_COUNTS_PER_UM)
+
+
+# -- enabled_axes: what the Z retract button keys off ------------------------
+
+def test_hw_enabled_axes_follow_enable_disable_and_estop(hw):
+    hw.enabled_axes = set()
+    hw.enable_axes("ABC")
+    assert hw.enabled_axes == {"A", "B", "C"}
+    hw.disable_axes("C")
+    assert hw.enabled_axes == {"A", "B"}
+    hw.enable_axes("C")
+    hw.emergency_stop()
+    assert hw.enabled_axes == set()

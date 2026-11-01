@@ -175,10 +175,10 @@ def test_the_blind_speed_stays_well_under_the_jog_default(panel):
     """
     from ui.panels.jog_panel import BLIND_JOG_SPEED
     overshoot_um = BLIND_JOG_SPEED / 6.4 * 0.165
-    assert BLIND_JOG_SPEED <= 1000, (
+    assert BLIND_JOG_SPEED <= 3000, (
         f"{BLIND_JOG_SPEED} counts/s coasts {overshoot_um:.0f} um past the "
         f"switch at a ~165 ms poll cycle")
-    assert overshoot_um < 30, f"{overshoot_um:.0f} um of blind overshoot"
+    assert overshoot_um < 80, f"{overshoot_um:.0f} um of blind overshoot"
 
 
 # -- Soft limits must not fire on a reading that is off the tape --------------
@@ -233,8 +233,32 @@ def test_insert_stops_after_a_run_of_clean_reads(panel):
         panel.on_status_updated(status(panel._ctrl, enc=0))
 
     assert panel._rz_state == rz(panel)["on"]
-    assert ("halt_axis", ("C",)) in panel._queued, "left the axis jogging"
+    assert ("_insert_return_sequence", (ORIGIN,)) in panel._queued, (
+        "left the axis jogging, or did not send it back to 0 um")
     assert panel._btn_rz.text() == "Retract Z"
+
+
+def test_insert_finishes_closed_loop_at_the_micron_origin(panel):
+    """The jog stops wherever the tape is first found; the return makes every
+    insert end at 0 um. Halt first - a closed-loop move must not start while the
+    blind jog is still running."""
+    calls = []
+    panel.controller = type("C", (), {
+        "halt_axis": lambda self, ax: calls.append(("halt_axis", ax)),
+        "move_to_counts": lambda self, ax, tgt, **k: calls.append(("move_to_counts", ax, tgt)),
+    })()
+    panel._insert_return_sequence(ORIGIN)
+    assert calls == [("halt_axis", "C"), ("move_to_counts", "C", ORIGIN)]
+
+
+def test_insert_without_an_origin_only_halts(panel):
+    calls = []
+    panel.controller = type("C", (), {
+        "halt_axis": lambda self, ax: calls.append("halt"),
+        "move_to_counts": lambda self, *a, **k: calls.append("move"),
+    })()
+    panel._insert_return_sequence(0.0)
+    assert calls == ["halt"], "moved to a raw _TP of 0 - hundreds of mm away"
 
 
 def test_insert_waits_when_nobody_read_the_encoder(panel):
@@ -317,9 +341,15 @@ def test_a_failing_command_does_not_strand_the_button(panel):
     panel._worker.error_occurred.emit("C: limit active - jogging + drives into it")
     panel._app.processEvents()
 
+    # An abort no longer guesses where the head is: it lands off_tape and asks
+    # the encoder, holding the button only until that answers.
+    assert panel._rz_state == rz(panel)["off"]
+    assert panel._rz_check is not None, "did not ask the encoder after the abort"
+    from ui.panels.jog_panel import _RZ_CHECK_READS
+    for _ in range(_RZ_CHECK_READS):
+        panel.on_status_updated(status(panel._ctrl, enc=ENC_ERROR))
     assert panel._btn_rz.isEnabled(), "button stayed dead after the move failed"
     assert panel._rz_state == rz(panel)["off"]
-    assert "stopped" in panel._rz_note.text()
 
 
 # -- The confirmation prompts -------------------------------------------------
@@ -560,3 +590,167 @@ def test_a_cancelled_prompt_writes_nothing(panel):
     panel._confirm = lambda *a: False
     panel._btn_rz.click(); panel._app.processEvents()
     assert _stored(panel) is None, "recorded a retract the user declined"
+
+
+# -- The state is CHECKED against the encoder on connect ----------------------
+#
+# 2026-10-08: Z was retracted from a laptop, the controller moved to this PC, and
+# this PC - whose stored state had never heard of the retract - offered Retract Z
+# on a head already parked off the tape. The file is per PC; the encoder is not.
+
+def _check(panel, n, **kw):
+    from ui.panels.jog_panel import _RZ_CHECK_READS
+    panel.check_z_retract()
+    for _ in range(n if n is not None else _RZ_CHECK_READS):
+        panel.on_status_updated(status(panel._ctrl, **kw))
+    panel._app.processEvents()
+
+
+def test_a_retract_done_elsewhere_is_found_on_connect(panel):
+    """Stored on_tape, encoder flagged and the switch pressed: retracted."""
+    _check(panel, None, fwd=True, enc=ENC_ERROR, pos=ORIGIN + 8_388_608)
+    assert panel._rz_state == rz(panel)["off"]
+    assert panel._btn_rz.text() == "Insert Z"
+    assert panel._z_manual_locked("C")
+    assert panel._worker.soft_limits.is_suspended("C")
+    with open(panel._state_path) as f:
+        assert "off_tape" in f.read()
+
+
+def test_the_switch_is_declared_the_retract_end(panel):
+    """A stale last_direction must not label the switch as the insert's end."""
+    _check(panel, None, fwd=True, enc=ENC_ERROR)
+    names = [n for n, a in panel._queued]
+    assert "declare_limit_end" in names
+    args = dict(panel._queued)["declare_limit_end"]
+    assert args == ("C", AXIS_SIGN["C"] * -1), "declared the wrong end"
+
+
+def test_an_insert_done_elsewhere_is_found_on_connect(panel):
+    panel._set_rz_state(rz(panel)["off"])
+    _check(panel, None, enc=4)                       # warning only, on the tape
+    assert panel._rz_state == rz(panel)["on"]
+    assert panel._btn_rz.text() == "Retract Z"
+    assert not panel._worker.soft_limits.is_suspended("C")
+    assert "C" not in panel._worker.watch_encoder
+
+
+def test_one_bad_read_is_enough_to_call_it_retracted(panel):
+    from ui.panels.jog_panel import _RZ_CHECK_READS
+    panel.check_z_retract()
+    for i in range(_RZ_CHECK_READS):
+        panel.on_status_updated(status(panel._ctrl, enc=ENC_ERROR if i == 4 else 0))
+    assert panel._rz_state == rz(panel)["off"]
+
+
+def test_an_unflagged_but_impossible_position_is_off_the_tape(panel):
+    """The bit-23 corruption passed the flags on most reads; position catches it."""
+    _check(panel, None, enc=0, pos=ORIGIN + 8_388_608)
+    assert panel._rz_state == rz(panel)["off"]
+
+
+def test_a_timeout_bit_is_not_valid_data(panel):
+    _check(panel, None, enc=1)
+    assert panel._rz_state == rz(panel)["off"]
+
+
+def test_z_is_locked_until_the_check_answers(panel):
+    panel.check_z_retract()
+    panel.on_status_updated(status(panel._ctrl, enc=0))
+    assert not panel._btn_rz.isEnabled()
+    assert panel._z_manual_locked("C")
+    assert "C" in panel._worker.watch_encoder
+
+
+def test_an_unreadable_encoder_does_not_lock_z_forever(panel):
+    from ui.panels.jog_panel import _RZ_CHECK_READS
+    panel.check_z_retract()
+    for _ in range(3 * _RZ_CHECK_READS + _RZ_CHECK_READS):
+        panel.on_status_updated(status(panel._ctrl, enc=None))
+    assert panel._rz_check is None
+    assert panel._rz_state == rz(panel)["off"], "unknown must land on the safe side"
+
+
+def test_declare_limit_end_relabels_a_pressed_switch(ctrl):
+    ctrl._last_dir["C"] = -1
+    ctrl.declare_limit_end("C", +1)
+    ctrl.set_trip_points("C", 0.0, -10_000_000.0)    # pressed at the fwd boundary
+    st = ctrl.poll_all_axes()["C"]
+    assert st.fwd_limit and not st.rev_limit
+
+
+# -- Only with the motors enabled ---------------------------------------------
+#
+# A retract or insert queued with C off moves nothing, but the button used to
+# flip anyway, leaving the stored state saying retracted when the head was in,
+# or the reverse.
+
+def test_button_is_dead_until_enable_motors(panel):
+    panel._ctrl.disable_axes("ABC")
+    panel.on_status_updated(status(panel._ctrl))
+    assert not panel._btn_rz.isEnabled()
+    assert "Enable Motors" in panel._btn_rz.toolTip()
+    panel._ctrl.enable_axes("ABC")
+    panel.on_status_updated(status(panel._ctrl))
+    assert panel._btn_rz.isEnabled()
+
+
+def test_a_click_with_motors_off_changes_nothing(panel):
+    panel._ctrl.disable_axes("ABC")
+    panel._queued.clear()
+    panel._on_retract_clicked()          # bypasses the disabled button
+    assert panel._rz_state == rz(panel)["on"]
+    assert panel._queued == [] and panel._prompts == []
+    assert not os.path.exists(panel._state_path), "recorded a retract that never ran"
+
+
+def test_disabling_mid_insert_aborts_and_rechecks(panel):
+    panel._set_rz_state(rz(panel)["off"])
+    panel._btn_rz.click(); panel._app.processEvents()
+    assert panel._rz_state == rz(panel)["inserting"]
+    panel._ctrl.emergency_stop()
+    panel.on_status_updated(status(panel._ctrl, enc=ENC_ERROR))
+    assert panel._rz_state == rz(panel)["off"], "claimed inserted after an E-STOP"
+    assert panel._rz_check is not None
+
+
+def test_only_c_matters(panel):
+    panel._ctrl.disable_axes("AB")
+    panel.on_status_updated(status(panel._ctrl))
+    assert panel._btn_rz.isEnabled()
+
+
+# -- The blind clock starts with the blind jog, not the button ----------------
+#
+# 2026-10-08: retract from +40 mm. The closed-loop approach to 0 um took 51.6 s,
+# the timeout counted it as blind travel, and the retract aborted 0.1 s into the
+# jog - stopping at ~0 um, where the -100 um soft limit then lit up and looked
+# like the cause.
+
+def _park_at_plus_40mm(ctrl):
+    # Stage +Z is controller -C, so +40 mm is BELOW the origin in counts.
+    at = ORIGIN - 40_000 * ENC
+    ctrl._pos["C"] = ctrl._target["C"] = at
+
+
+def test_a_long_approach_does_not_use_up_the_blind_allowance(panel):
+    import time as _t
+    panel._btn_rz.click(); panel._app.processEvents()
+    # The approach took longer than the whole blind allowance...
+    panel._rz_started = _t.monotonic() - panel._blind_timeout_s() - 30
+    # ...then the queued sequence finishes it and starts the jog.
+    _park_at_plus_40mm(panel._ctrl)
+    panel._retract_sequence(ORIGIN)
+    panel.on_status_updated(status(panel._ctrl))
+    assert panel._rz_state == rz(panel)["retracting"], (
+        "aborted on time spent in the closed-loop approach")
+
+
+def test_the_blind_phase_is_still_bounded(panel):
+    import time as _t
+    panel._btn_rz.click(); panel._app.processEvents()
+    _park_at_plus_40mm(panel._ctrl)
+    panel._retract_sequence(ORIGIN)
+    panel._rz_started = _t.monotonic() - panel._blind_timeout_s() - 1
+    panel.on_status_updated(status(panel._ctrl))
+    assert panel._rz_state != rz(panel)["retracting"]

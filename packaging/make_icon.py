@@ -1,61 +1,40 @@
-r"""Generate packaging/galil_suite.ico - the app, shortcut and installer icon.
+r"""Generate packaging/stork.ico - the app, shortcut, window and installer icon.
 
-The project shipped no artwork, and Windows needs a real multi-resolution .ico
-for the desktop shortcut, the taskbar and the Add/Remove Programs entry.
+The manipulator this app drives is called "Stork", so the icon is a stork's
+head: a white head and neck, a long red-orange bill and a black eye on a blue
+plate. Kept to a handful of flat shapes because at 16x16 the icon is a few
+coloured pixels and only the silhouette survives - the bill is what makes it
+read as a stork rather than a generic bird, so it stays long and bright.
 
-Drawn rather than embedded as a blob so it stays editable in a diff: a three
-arrow XYZ triad, which is what the app actually drives. Colours are picked to
-stay distinguishable at 16x16, where the icon is mostly a coloured smudge and
-silhouette is all that survives.
+Drawn rather than embedded as a blob so it stays editable in a diff.
 
 No Pillow dependency - the sizes are rendered with QPainter (PyQt5 is already a
 requirement) and packed into an ICO container by hand. An ICO is a 6-byte
 header, one 16-byte directory entry per image, then the image payloads; storing
 each payload as PNG is valid for Vista and later and keeps the file small.
 
-    python packaging/make_icon.py
+    python packaging/make_icon.py            # writes packaging/stork.ico
+    python packaging/make_icon.py --png DIR  # also a PNG per size, to look at
 """
+import argparse
 import os
 import struct
 import sys
 
 from PyQt5.QtCore import QBuffer, QByteArray, QPointF, Qt
-from PyQt5.QtGui import (QColor, QGuiApplication, QImage, QPainter, QPainterPath,
-                         QPen, QPolygonF)
+from PyQt5.QtGui import (QColor, QGuiApplication, QImage, QLinearGradient,
+                         QPainter, QPainterPath, QPen)
 
 SIZES = (16, 24, 32, 48, 64, 128, 256)
+ICON_NAME = "stork.ico"
 
-BG     = QColor("#161c26")   # matches ui/dark_theme.qss
-X_COL  = QColor("#ff6b5a")   # X / axis A
-Y_COL  = QColor("#5ad18f")   # Y / axis B
-Z_COL  = QColor("#5aa9ff")   # Z / axis C
-ORIGIN = QColor("#f2f5f8")
-
-
-def _arrow(p: QPainter, s: float, ox: float, oy: float,
-           dx: float, dy: float, colour: QColor, width: float) -> None:
-    """One axis: a shaft from the origin plus a solid arrowhead."""
-    x2, y2 = ox + dx, oy + dy
-    pen = QPen(colour, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-    p.setPen(pen)
-    p.drawLine(QPointF(ox, oy), QPointF(x2, y2))
-
-    # Arrowhead, built in the direction of travel so it sits flush on the shaft.
-    length = (dx * dx + dy * dy) ** 0.5
-    if length == 0:
-        return
-    ux, uy = dx / length, dy / length
-    px, py = -uy, ux                      # perpendicular
-    head = max(s * 0.11, 2.2)
-    half = head * 0.52
-    tip = QPointF(x2 + ux * width * 0.2, y2 + uy * width * 0.2)
-    base_x, base_y = x2 - ux * head, y2 - uy * head
-    poly = QPolygonF([tip,
-                      QPointF(base_x + px * half, base_y + py * half),
-                      QPointF(base_x - px * half, base_y - py * half)])
-    p.setPen(Qt.NoPen)
-    p.setBrush(colour)
-    p.drawPolygon(poly)
+SKY_TOP    = QColor("#3d8fd1")
+SKY_BOTTOM = QColor("#1f5f99")
+FEATHER    = QColor("#ffffff")
+FEATHER_SH = QColor("#d9e2ea")   # the shaded side of the neck
+BILL       = QColor("#f05a28")
+BILL_DARK  = QColor("#c8431a")
+EYE        = QColor("#111111")
 
 
 def render(size: int) -> QImage:
@@ -64,39 +43,73 @@ def render(size: int) -> QImage:
 
     p = QPainter(img)
     p.setRenderHint(QPainter.Antialiasing, True)
-
     s = float(size)
-    # Rounded plate, inset slightly so the corners are not clipped.
-    inset = s * 0.04
-    radius = s * 0.22
-    path = QPainterPath()
-    path.addRoundedRect(inset, inset, s - 2 * inset, s - 2 * inset, radius, radius)
-    p.fillPath(path, BG)
-    p.setPen(QPen(QColor("#2b3646"), max(s * 0.02, 0.6)))
-    p.drawPath(path)
 
-    # Origin sits low-left of centre so all three arrows get room.
-    ox, oy = s * 0.36, s * 0.64
-    width = max(s * 0.075, 1.4)
-    reach = s * 0.30
+    def pt(x: float, y: float) -> QPointF:      # unit square -> pixels
+        return QPointF(x * s, y * s)
 
-    _arrow(p, s, ox, oy,  reach * 1.05,          0.0,          X_COL, width)  # +X right
-    _arrow(p, s, ox, oy,  0.0,          -reach * 1.05,         Y_COL, width)  # +Y up
-    _arrow(p, s, ox, oy, -reach * 0.72,  reach * 0.72,         Z_COL, width)  # +Z toward viewer
+    # Rounded plate.
+    inset, radius = s * 0.03, s * 0.22
+    plate = QPainterPath()
+    plate.addRoundedRect(inset, inset, s - 2 * inset, s - 2 * inset, radius, radius)
+    grad = QLinearGradient(0, 0, 0, s)
+    grad.setColorAt(0.0, SKY_TOP)
+    grad.setColorAt(1.0, SKY_BOTTOM)
+    p.fillPath(plate, grad)
+    p.setClipPath(plate)                         # the neck runs off the bottom
 
+    # Neck: a gentle S rising from the bottom edge into the back of the head.
+    neck = QPainterPath(pt(0.16, 1.02))
+    neck.cubicTo(pt(0.20, 0.78), pt(0.32, 0.60), pt(0.30, 0.34))
+    neck.lineTo(pt(0.50, 0.34))                  # hidden inside the head
+    neck.cubicTo(pt(0.56, 0.60), pt(0.48, 0.80), pt(0.50, 1.02))
+    neck.closeSubpath()
+    p.fillPath(neck, FEATHER)
+    # A shaded strip down the front of the neck, only where it can be seen.
+    if size >= 32:
+        shade = QPainterPath(pt(0.44, 0.52))
+        shade.cubicTo(pt(0.50, 0.66), pt(0.45, 0.82), pt(0.47, 1.02))
+        shade.lineTo(pt(0.50, 1.02))
+        shade.cubicTo(pt(0.48, 0.80), pt(0.56, 0.60), pt(0.50, 0.34))
+        shade.closeSubpath()
+        p.fillPath(shade, FEATHER_SH)
+
+    # Bill: long, straight and tapering, pointing forward and a little down.
+    # Drawn before the head so the head overlaps its root cleanly.
+    bill = QPainterPath(pt(0.46, 0.24))
+    bill.lineTo(pt(0.93, 0.47))
+    bill.lineTo(pt(0.91, 0.50))
+    bill.lineTo(pt(0.46, 0.40))
+    bill.closeSubpath()
+    p.fillPath(bill, BILL)
+    if size >= 48:                               # the line between the mandibles
+        p.setPen(QPen(BILL_DARK, s * 0.012, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(pt(0.52, 0.33), pt(0.91, 0.485))
+        p.setPen(Qt.NoPen)
+
+    # Head.
     p.setPen(Qt.NoPen)
-    p.setBrush(ORIGIN)
-    r = max(s * 0.045, 1.0)
-    p.drawEllipse(QPointF(ox, oy), r, r)
+    p.setBrush(FEATHER)
+    p.drawEllipse(pt(0.40, 0.31), s * 0.15, s * 0.13)
+
+    # Eye: never smaller than a pixel, or it vanishes at 16x16.
+    r = max(s * 0.032, 0.9)
+    p.setBrush(EYE)
+    p.drawEllipse(pt(0.435, 0.285), r, r)
+
     p.end()
     return img
 
 
 def png_bytes(img: QImage) -> bytes:
-    buf = QBuffer(QByteArray())
+    # Hold the QByteArray in a name: QBuffer does not own it, so a temporary
+    # can be garbage-collected mid-write - an intermittent segfault.
+    data = QByteArray()
+    buf = QBuffer(data)
     buf.open(QBuffer.WriteOnly)
     img.save(buf, "PNG")
-    return bytes(buf.data())
+    buf.close()
+    return bytes(data)
 
 
 def build_ico(path: str) -> None:
@@ -117,11 +130,19 @@ def build_ico(path: str) -> None:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Draw the Stork Controller icon")
+    ap.add_argument("--png", metavar="DIR", help="also write one PNG per size here")
+    args = ap.parse_args()
+
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QGuiApplication(sys.argv)          # noqa: F841 - needed for QPainter
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "galil_suite.ico")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), ICON_NAME)
     build_ico(out)
     print(f"wrote {out} ({os.path.getsize(out)} bytes, sizes {', '.join(map(str, SIZES))})")
+    if args.png:
+        os.makedirs(args.png, exist_ok=True)
+        for n in SIZES:
+            render(n).save(os.path.join(args.png, f"stork_{n}.png"))
     return 0
 
 

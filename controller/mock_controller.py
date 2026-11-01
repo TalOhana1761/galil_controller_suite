@@ -89,6 +89,7 @@ class MockGalilController:
 
         # BiSS status word per axis; 0 = healthy. See encoder_status().
         self._enc_status = {ax: 0 for ax in AXES}
+        self._inputs: dict = {}       # @IN[n]; unset inputs read 1 (nothing pulling them)
         # Direction of travel when each switch closed, latched on the
         # transition. See _limit_state().
         self._limit_trip_dir = {ax: 0 for ax in AXES}
@@ -110,7 +111,13 @@ class MockGalilController:
         return self.info
 
     def disconnect(self):
+        self.disable_axes("ABC")
         self.info.connected = False
+
+    @property
+    def enabled_axes(self) -> set:
+        """Mirror of GalilController.enabled_axes, from the simulated servo state."""
+        return {ax for ax in AXES if self._servo[ax]}
 
     def reconnect(self) -> bool:
         """Mock twin of GalilController.reconnect(); nothing to clear."""
@@ -596,6 +603,20 @@ class MockGalilController:
         what the Z insert waits to clear.
         """
         return int(self._enc_status.get(axis.upper(), 0))
+
+    def declare_limit_end(self, axis: str, direction: int):
+        """Mirror of GalilController.declare_limit_end(): which end the switch is."""
+        axis = axis.upper()
+        direction = +1 if direction > 0 else -1
+        self._last_dir[axis] = direction
+        self._limit_trip_dir[axis] = direction
+
+    def digital_input(self, n: int) -> int:
+        """@IN[n] stand-in. 1 unless simulate_digital_input() set it."""
+        return int(self._inputs.get(int(n), 1))
+
+    def simulate_digital_input(self, n: int, value: int):
+        self._inputs[int(n)] = int(value)
 
     def simulate_encoder_status(self, axis: str, value: int):
         """Force the BiSS status word, e.g. 8 (error) for a head off the tape."""

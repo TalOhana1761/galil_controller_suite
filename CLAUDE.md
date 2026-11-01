@@ -1,7 +1,12 @@
 # Galil Controller Suite — Project Notes
 
 PyQt5 GUI for a Galil DMC-4133 3-axis stepper/servo controller (Light Injector
-setup, axes A/B/C mapped to X/Y/Z). See `README.md` for install/run instructions;
+setup, axes A/B/C mapped to X/Y/Z).
+
+**The operator-facing name is "Stork Controller"** (since 1.2.0, 2026-10-12) —
+Stork is what the lab calls the manipulator. The code, repo, classes and log
+file keep "Galil"; only what the operator SEES says Stork. See "The Stork
+name" under the installer section for exactly where the line falls. See `README.md` for install/run instructions;
 this file is orientation for working in the codebase.
 
 ## Architecture
@@ -25,6 +30,15 @@ sets how far a jog overshoots a limit, so it is a number worth knowing.
   `gclib`. UI code queues controller calls via `worker.queue_command(fn, *args)`;
   the worker drains the queue then polls all axes once per cycle and emits
   `status_updated`.
+  - A queued closed-loop move (step click, HOME, GO TO) **blocks the worker**,
+    so no poll runs until it returns. Two hooks on `GalilController` keep the
+    UI live meanwhile, both called by the move loop every
+    `PROGRESS_INTERVAL_S` (0.1 s) on the worker thread:
+    `position_listener(axis, counts)` → `move_progress` signal (position only),
+    and `motion_tick()` → `_poll_touch_alarm()`. Neither is installed by the
+    hardware scripts, so their command stream is unchanged.
+  - Never "fix" a frozen display with a second thread talking to gclib: two
+    threads on one serial link is how replies desynchronise.
 - `GalilController` (`controller/galil_controller.py`) wraps `gclib`. It is a
   pure-Python class with no Qt imports.
 - `MockGalilController` (`controller/mock_controller.py`) is a drop-in
@@ -59,10 +73,54 @@ Two lessons from it that generalise beyond their sections:
   test.** `test_guard_does_not_halt_a_jog_escaping_a_limit` existed, passed, and
   did not catch the escape bug, because it forced the flags with
   `simulate_rev_limit()` instead of driving the axis to the trip point.
-- **When a failure looks impossible, suspect the test runner.** pytest is not
-  installed; the stand-in runner grew fixture caching, stacked `parametrize` and
-  yield-fixtures during this session, each time because tests failed for its
-  reasons rather than the code's.
+- **When a failure looks impossible, suspect the test runner.** pytest was not
+  installed then; the stand-in runner grew fixture caching, stacked `parametrize`
+  and yield-fixtures during this session, each time because tests failed for its
+  reasons rather than the code's. (pytest is installed now — see Testing.)
+
+## What changed on 2026-10-08
+
+| | |
+|---|---|
+| **Live position during closed-loop moves** | step clicks, HOME and GO TO used to freeze the readout until the move ended; the move loop now reports its own `_TP` readings via `position_listener` → `move_progress`. Confirmed on the rig by the user |
+| **Touch alarm documented** | DI1, 0 = alarm, display only; added in an earlier session but never written up — see its section |
+| **Touch alarm read mid-move** | via `motion_tick`, so it no longer goes stale during a move. **Report only: what a touch should DO is undecided**, and `_poll_touch_alarm()` is where that goes |
+| **pytest is installed** | the stand-in runner is retired; 334 tests after the retract fixes |
+| **Window sized to its content** | opens at ~1123×642 instead of a fixed 1400×860; see "Window size" |
+| **Scales on other PCs** | fractional DPI scaling (`PassThrough`), panels in scroll areas, window clamped to the screen; see "Window size" |
+| **Connection panel fixes** | real COM port list, scan double-click goes to the right field, the build PC's `COM4` no longer ships, `--direct` retry; **confirmed connecting on a peer's laptop with 1.1.1**. See "Connecting on another PC" |
+| **Installer 1.1.1** | rebuilt with all of the above, plus a `--direct` retry on a failed serial open |
+| **Z retract state checked on connect** | the state file is per PC, so a retract done from a laptop was invisible to this PC, which offered Retract Z on a parked head and showed both Z limits. The encoder now decides; see "The state is CHECKED against the encoder on connect" |
+| **Retract/Insert needs Enable Motors** | clicked with the motors off, the button flipped with nothing moving and the stored state went wrong. Every abort now re-checks the encoder instead of guessing |
+| **Retract from far out works** | the blind timeout counted the closed-loop approach, so a retract from +40 mm aborted at 0 um. Looked like the -100 um soft limit; was not |
+| **Installer 1.1.2** | all three retract fixes. **Confirmed on the rig by the user**: a retract at 16:23 logged 7472 µm of blind travel, the ~7.4 mm expected, now that the clock starts at the jog |
+| **No retract check in `--mock`** | the mock sits at 0 counts, millions from the rig's micron origin, so the check always said "retracted" and wrote that into the SAME state file the real app reads. Found by smoke-testing the frozen build |
+| **`tests/conftest.py`** | redirects `z_retract_state.STATE_PATH` for EVERY test. Nine key-jog tests failed once the rig was genuinely retracted, because they read the real file |
+| **Build script's "MOCK ONLY" warning was false** | it checked `_internal/gclib/`, the spec puts the DLLs in `_internal/`. 1.1.x builds always had them; the check now looks where `add_bundled_dll_dir()` does |
+
+Lesson from the retract fixes: **a symptom at a soft limit is not proof the
+soft limit did it.** The retract stopped at -100 um and the flag lit, so the
+soft limit was blamed; the log showed an abort on a timeout 0.1 s into the jog,
+and the flag only appeared afterwards, once Z was correctly back on the tape.
+Read the log's order of events before fixing the thing that is visible.
+
+Lesson: **a test that counts reads made inside a time window is flaky.**
+`test_hw_without_a_listener_issues_no_extra_reads` first compared total `_TP`
+counts, which vary with machine speed because `_wait_until_still()` reads for
+as long as its window lasts; it failed once in a full run and passed alone. It
+now counts only reads taken while the axis is moving, which is structural.
+
+## What changed on 2026-10-12
+
+| | |
+|---|---|
+| **X limit switch enabled** | the user fitted a physical NC switch on X; `"A": "FWD"` added to `LIMIT_INPUT`, so X now behaves exactly like Y and Z (blocks the direction that reached it, jog guard halts, step moves stop on the trip). Declared FWD to match B and C; **confirmed on the rig by the user** in `run.py`'s jog screen — X moves both ways at rest and the switch blocks it, so FWD is the right terminal (REV would have read permanently at a limit) |
+| **Poll is now 3×`_TP` + 3 limit reads + DI1** | one more ~16 ms read per cycle, so the jog overshoot grows by roughly 10 µm at 4000 counts/s. Not re-measured |
+| **Installer 1.1.3** | `packaging/_output/GalilControllerSuite-Setup-1.1.3.exe`, built from the working tree with the X switch. gclib DLLs confirmed bundled, and the frozen `LIMIT_INPUT` checked by disassembly to contain A. Superseded by 1.2.0 the same day |
+| **Renamed to "Stork Controller" for the operator** | window title, sidebar label, Start menu, desktop shortcut, Add/Remove Programs, exe (`StorkController.exe`) and setup file. Code names unchanged. See "The Stork name" |
+| **Stork-head icon** | `packaging/stork.ico`, drawn by `make_icon.py`; replaces the XYZ-triad `galil_suite.ico`. Now also the WINDOW icon (it never had one — the title bar showed python's) |
+| **`make_icon.py` segfault fixed** | `QBuffer(QByteArray())` let the temporary be garbage-collected mid-write; crashed ~1 run in 4. It sits in the build, so it could fail a build at random |
+| **Installer 1.2.0** | `packaging/_output/StorkController-Setup-1.2.0.exe`: the X switch plus the rename and icon. gclib DLLs bundled, icon checked on both exes, mock window checked from source. **Not yet installed anywhere — in particular the upgrade over 1.1.x is untested** |
 
 ## Directory map
 
@@ -86,7 +144,7 @@ ui/
   polling_worker.py        100 ms poll loop, command queue
   panels/
     connection_panel.py    Wired into main_window
-    jog_panel.py            Wired into main_window
+    jog_panel.py            Wired into main_window; also hosts the touch alarm box
     log_panel.py             Wired into main_window
     settings_panel.py        Soft travel limits (added 2026-09-24)
 utils/
@@ -101,8 +159,9 @@ utils/
   logger_setup.py           loguru + Qt LogBridge for the log panel
 packaging/
   build_installer.py       ONE command to build the Windows installer
-  make_icon.py             draws galil_suite.ico (no Pillow; QPainter + a hand-packed ICO)
-  galil_suite.spec         PyInstaller: what to freeze, bundle and exclude
+  make_icon.py             draws stork.ico, a stork head (no Pillow; QPainter + a hand-packed ICO)
+  stork.ico                the app/window/installer icon (generated, tracked)
+  galil_suite.spec         PyInstaller: what to freeze, bundle and exclude -> StorkController.exe
   installer.iss            Inno Setup: the wizard, shortcuts and uninstaller
   README.md                how to rebuild, and the two things that break it
 config/
@@ -135,7 +194,7 @@ tests/                       pytest suite; test_move_microns.py also drives the
   only where one is wired** — reduced from 9 registers to 2 to keep the 100 ms
   cycle fast. Since 2026-09-24 it reads the switch per `LIMIT_INPUT` and
   resolves which END it means from `last_direction`, instead of reading `_LF`
-  and copying it into both flags. Only C has a switch; A and B have none.
+  and copying it into both flags. All three axes have one switch each since 2026-10-12.
   Because of this, `AxisStatus.pos_ref`,
   `.vel`, `.err`, `.torque`, `.stop_code`, `.servo_on`, `.home_switch` stay at
   their Pydantic defaults for the **real** controller — only `pos`, `fwd_limit`,
@@ -321,6 +380,7 @@ history if anything in them is worth salvaging.
 | `settle_window_ms` | 200 default / **60 for jogging** | `JOG_SETTLE_WINDOW_MS` | speed/accuracy dial; a move costs 3–4 windows |
 | `YA` | 64 | `enable_axes()` | declares the drive's fixed 1/64 microstepping for SPM |
 | `LD` | 3 | `enable_axes()` | hardware limit switching OFF — software is the only protection |
+| `AG` | 1 / 1 / **3** (A/B/C) | `AXIS_AMP_GAIN`, `enable_axes()` | drive amps per phase, matched to the motors: X/Y 1 A, Z 3 A (2026-11-01) |
 
 ### Config files
 
@@ -596,13 +656,42 @@ The panel imports that constant from `galil_controller` inside a `try/except`:
 `run.py` imports that module only in the non-mock branch and it imports `gclib`
 at the top, so an unguarded import would break `--mock` where gclib is absent.
 
-**Caveat:** `move_microns()` blocks, and the jog panel queues onto
-`PollingWorker` — the same thread that polls. The position readout freezes for
-the duration of a move (~0.3-0.4 s per jog click). Fixing that properly means
-letting the worker poll between loop steps, which is a change to the threading
-model.
+**`move_microns()` blocks the polling thread** — the jog panel queues onto
+`PollingWorker`, the same thread that polls — so `status_updated` is silent for
+the whole move. Since 2026-10-08 the readout no longer freezes:
+`GalilController.position_listener` receives the move's own `_TP` readings
+(throttled to `PROGRESS_INTERVAL_S` = 0.1 s, plus one extra `_TP` read per
+interval inside `_wait_motion()`), and the worker forwards them as
+`move_progress(axis, counts)`. **Position only**: limit flags, button state and
+the Z retract state machine still wait for the next real poll. (The touch alarm
+is read mid-move too, through the sibling hook `motion_tick` — see its section.) No listener (the
+hardware scripts) means no extra reads, so their timing is unchanged. A second
+thread was not the answer: only one thread may talk to gclib, or the link desyncs.
 
-### Motor current and heating — settled, no action (2026-09-23)
+### Motor current: Z now driven at 3 A (2026-11-01)
+
+**The section below assumed one 1.2 A motor on every axis. The datasheets say
+otherwise: X and Y are 1 A motors, Z's is 3 A.** So the EEPROM's `AG=1` was
+right for X/Y and left Z at a third of its rated current (roughly a third of the
+torque) — a plausible contributor to Z's stiction and swallowed 1 µm moves,
+untested.
+
+- `enable_axes()` now sends `AG{ax}` from **`AXIS_AMP_GAIN = {"A": 1, "B": 1,
+  "C": 3}`** in `galil_controller.py`, after `MO` and `MT` (AG needs the axis
+  off). X/Y are set explicitly to the 1 A they already had, so nothing depends on
+  EEPROM any more.
+- `LC` is still not set, so at the EEPROM's `LC=0` Z now **holds 0.75 A at rest**
+  instead of 0.25 A. Expect it to run warmer.
+- `check_motor_current.py` rates per axis (`MOTOR_RATED_A`); it previously would
+  have called Z at 3 A "2.5x OVER" and recommended AG=1.
+- **Not yet run on the rig.** Z's motion behaviour (stiction, take-up,
+  relaxation, the tuned SP/AC/DC) was all measured at 1 A and may shift.
+- `test_enable_axes_sets_drive_current_per_motor` pins the values and ordering.
+- **Installer 1.2.1** (`packaging/_output/StorkController-Setup-1.2.1.exe`) carries
+  it: `AXIS_AMP_GAIN` confirmed in the frozen `galil_controller` by disassembly,
+  gclib DLLs bundled. Installs before 1.2.1 still run Z at the EEPROM's 1 A.
+
+### Motor current and heating — settled, no action (2026-09-23) — SUPERSEDED for Z, see above
 
 The motors run hot to the touch when idle. Investigated, and **nothing is
 wrong**:
@@ -795,6 +884,7 @@ three instead of a special case.
 
 ```python
 LIMIT_INPUT = {
+    "A": "FWD",          # NC switch on A's forward DMC input, wired 2026-10-12
     "B": "FWD",          # NC switch on B's forward DMC input, wired 2026-09-24
     "C": "FWD",          # NC switch on C's forward DMC input, wired 2026-09-24
 }
@@ -809,7 +899,8 @@ empty input from a tripped one, since both read ACTIVE.
 > **Add an entry the moment a switch is physically connected.** An unlisted axis
 > blocks nothing, and `LD=3` means the controller takes no limit action of its
 > own either — so it has NO end-stop protection beyond the `travel_mm` guard in
-> `_move_microns()`. As of 2026-09-24 **X is in exactly that state.**
+> `_move_microns()`. X was in exactly that state until its switch was declared
+> on 2026-10-12.
 
 Both declared switches sit at the **stage's minus end** (−Y and −Z), because B
 and C are reversed in software: controller +B/+C is stage −Y/−Z.
@@ -1493,9 +1584,10 @@ and **Insert Z** (green). It is one control because the two are a toggle:
 whichever it offers is the only one that makes sense from where the head is.
 
 **Retract**: closed loop to 0 µm, then **open loop** from there — a plain jog at
-`BLIND_JOG_SPEED` (1000 counts/s) until the limit switch stops it.
+`BLIND_JOG_SPEED` (3000 counts/s) until the limit switch stops it.
 **Insert**: jog back at the same speed until the encoder calls its own data valid
-again, i.e. the head is back on the tape at about 0 µm.
+again (3 clean polls), then halt and close the loop on 0 µm (2026-10-08) - the
+jog alone stopped wherever the tape was first found, not at a fixed place.
 
 Why open loop at all: **the Z limit switch at the stage's minus end sits BEYOND
 the scale tape.** Once the head runs off, `_TP` is not a valid reading, so no
@@ -1514,12 +1606,14 @@ would fix it properly.
 | `BLIND_JOG_SPEED` | µm/s | overshoot | 7.4 mm takes |
 |---|---|---|---|
 | 500 (until 2026-09-24) | 78 | ~13 µm | 95 s |
-| **1000 (now)** | **156** | **~26 µm** | **47 s** |
+| 1000 (until 2026-10-08) | 156 | ~26 µm | 47 s |
+| **3000 (now)** | **469** | **~77 µm** | **16 s** |
 | 4000 (the jog default) | 625 | ~100 µm | 12 s |
 
-Raised to 1000 because 95 s is a long time to watch; the doubled overshoot was
-accepted deliberately for it. The test ceiling is 1000, so going further is a
-decision that has to change a test as well.
+Raised to 1000 because 95 s is a long time to watch, then to 3000 because the
+round trip still took about a minute; the user accepted ~77 µm of coast past the
+switch for it. The test ceiling is 3000, so going further is a decision that has
+to change a test as well.
 
 #### Z's own controls are locked out for the whole round trip
 
@@ -1593,12 +1687,60 @@ so the blind phase cannot begin before the axis has arrived.
   completion. `AxisStatus.enc_status` is `None` when nobody asked — which is not
   a value to act on.
 
+#### The state is CHECKED against the encoder on connect (2026-10-08)
+
+The file below is per PC. Retracted from a laptop, then the controller moved to
+this PC: it offered **Retract Z** on a parked head, and showed BOTH Z limits
+(the real switch, labelled from this PC's stale `last_direction`, plus a soft
+limit evaluated against an off-tape `_TP`).
+
+`JogPanel.check_z_retract()` runs on every connect. **Not in `--mock`**: the
+mock's positions are nowhere near the rig's origin, so it would always answer
+"retracted" and write it into the shared state file. It locks
+Z, reads `_SSC0` with the poll for `_RZ_CHECK_READS` (10) cycles, and decides:
+
+- **on the tape** only if EVERY read has the error and timeout bits clear AND
+  `_TPC` lies within `axis_c.encoder_length_mm` of the micron origin. The
+  position test is what catches the bit-23 corruption, which passed the flags on
+  66 of 75 reads.
+- **off the tape** on any doubt, including an unreadable status. It then
+  `declare_limit_end("C", retract direction)`, so a pressed switch is labelled
+  the retract end whatever this PC last commanded - otherwise the stale label
+  refuses the very jog that inserts.
+
+The switch is logged but does not decide: invalid encoder data alone already
+makes closed-loop Z unsafe, and a pressed switch with valid data is the other
+end of travel. Soft limits on C are now suspended whenever the state is not
+`on_tape` (in `_set_rz_state()`, and on a restored `off_tape` at startup).
+The insert's stop condition also treats the timeout bit as invalid now.
+
+#### Only with Z's motor enabled, and an abort re-checks (2026-10-08)
+
+The button is disabled until **Enable Motors** has armed C in this session.
+Before, a click with the motors off queued a move that did nothing while the
+button still flipped, so the stored state said retracted with the head in, or
+the reverse.
+
+- `GalilController.enabled_axes` is a set kept by `enable_axes()` (added only
+  after `SH` succeeds), `disable_axes()`, `emergency_stop()`, `connect()` and
+  `disconnect()`. Software-tracked, so no extra poll read; a motor left on by
+  another PC does NOT count, because this session has not run the
+  CN/LD/SS configuration. The mock derives it from `_servo`.
+- The panel re-evaluates the button every poll, and `_on_retract_clicked()`
+  refuses too, so a stale enabled button cannot slip a click through.
+- Motor disabled mid-sequence (E-STOP, Disable Motors) aborts it at once.
+- **Every abort now lands in `off_tape` and runs `check_z_retract()`**. An
+  aborted insert used to be recorded as `on_tape` - a guess; the encoder now
+  decides.
+
 #### Bounds and failure
 
 - **The bound is `BLIND_MAX_TRAVEL_UM` = 10.5 mm, a DISTANCE.** The switch sits
   about **7.4 mm past 0 µm** — the first retract reported 100 s, but that timer
-  starts at the button press and so includes the closed-loop approach to 0 µm;
-  the blind part was 94 s at 78 µm/s. The check itself is a timeout — open loop,
+  then started at the button press and so included the closed-loop approach to
+  0 µm; the blind part was 94 s at 78 µm/s. **Since 2026-10-08 the clock starts
+  when the jog does** (`_retract_sequence()`), so the bound and the logged
+  distance are both blind travel only. The check itself is a timeout — open loop,
   elapsed time IS distance — but the seconds are DERIVED
   (`_blind_timeout_s()`), so **doubling the speed halved the timeout to 67 s
   while leaving the distance bound exactly where it was**. That is the whole
@@ -1606,15 +1748,21 @@ so the blind phase cannot begin before the axis has arrived.
   silently doubled how far a runaway could travel.
   Until the switch trips this is the ONLY thing bounding the move: a broken wire
   reads ACTIVE under `CN=1` and would stop it, but an unplugged one would not.
-- An aborted RETRACT lands in `off_tape`, not `on_tape`: the head may be
-  anywhere, possibly off the tape, and `off_tape` is the state whose button
-  offers the move that brings it back.
+- **Any abort, retract OR insert, lands in `off_tape` and then runs the
+  on-connect encoder check**, which moves it to `on_tape` if the head is there.
+  An aborted insert used to be recorded `on_tape` on the strength of which move
+  was running - a guess, and one way the state ended up backwards.
 - A queued command that RAISES aborts the sequence immediately, via
   `worker.error_occurred`. Without that the button would sit dead until the
   timeout — over two minutes, silently.
 - Retract refuses with a dialog if C has no micron origin: an absolute encoder
   never reads 0 on this rig, so `um_origin == 0` means it has never been set.
 #### The state is remembered across restarts
+
+**Since 2026-10-08 the file is only a fallback** until the on-connect encoder
+check answers, ~2 s after connecting; the check overrides it either way and
+logs a warning when they disagree. It still matters for that window and for
+what the button shows before any connection.
 
 `config/z_retract_state.json`, via `utils/z_retract_state.py`. Nothing on the rig
 can be asked whether the head is off the tape — `_TP` is not a valid reading
@@ -1646,10 +1794,163 @@ the Z lock and the disk write together, so persisting cannot be forgotten in one
 of the four transitions. The restore in `__init__` assigns directly and does NOT
 write back — loading is not a change.
 
-**Tests must redirect `z_retract_state.STATE_PATH`**, the same way the
-`move_microns` fixture redirects `LAST_DIR_PATH`. A fabricated `off_tape` in the
+**Tests must redirect `z_retract_state.STATE_PATH`** - `tests/conftest.py` now
+does it for every test (autouse), the same idea as the `move_microns` fixture
+redirecting `LAST_DIR_PATH`. A fabricated `off_tape` in the
 real file is worse than no file: the panel would offer Insert Z on a stage that
 was never retracted.
+
+### Touch alarm (added 2026-10)
+
+A **Touch Alarm** box in the jog panel's right-hand column, under the limit
+table: **Off** (green), **On** (red), or **—** (grey, unknown). It shows whether
+the manipulator hand is touching metal it should not.
+
+**Wiring: digital input DI1, pin 2 of the 44-pin I/O connector**, read as
+`MG @IN[1]` (`GalilController.digital_input(n)`). The input is pulled up, and
+the hand shorts it to ground on contact, so:
+
+| `@IN[1]` | meaning |
+|---|---|
+| 1 | clear — box reads **Off** |
+| 0 | **touching** — box reads **On** |
+
+**The polarity is the trap:** 0 is the alarm. Getting it backwards shows a green
+"Off" while the hand is touching, which is worse than no display.
+`test_zero_is_the_alarm` guards it.
+
+How it flows:
+
+- `TOUCH_ALARM_INPUT = 1` in `ui/polling_worker.py`, held per instance as
+  `PollingWorker.touch_alarm_input`; set it to `None` to stop reading it. The
+  jog panel imports the constant for its tooltip, so the two cannot disagree.
+- `PollingWorker._poll_touch_alarm()` runs once per cycle, **after**
+  `status_updated` is emitted, and emits `touch_alarm(object)`: `True` = alarm,
+  `False` = clear, `None` = the read failed. **A failed read is `None`, never
+  `False`** — "could not read it" must not display as "Off".
+- It logs only on a change: `TOUCH ALARM ON (DI1 = 0)` as a warning,
+  `Touch alarm cleared (DI1 = 1)` as info, and one warning when it stops being
+  readable. Not every cycle.
+- `main_window` connects `touch_alarm` to `JogPanel.on_touch_alarm()`, which
+  calls `_set_touch_box()`.
+- The mock reads every input as 1 (clear) unless
+  `MockGalilController.simulate_digital_input(n, value)` sets it.
+
+Limits of what it does:
+
+- **Display only. Nothing stops motion on a touch** — no halt, no button
+  lockout, no jog guard. **What a touch should do has deliberately not been
+  decided yet** (user, 2026-10-08). `test_an_alarm_during_a_move_is_reported_and_the_move_carries_on`
+  pins "report only", so changing that is a decision that also changes a test.
+- **It is also read from inside a blocking move** (2026-10-08). A
+  `move_microns()` / HOME / GO TO holds off the poll for its whole duration, so
+  `PollingWorker` hangs the same `_poll_touch_alarm()` on
+  `GalilController.motion_tick`, which the move loop calls every
+  `PROGRESS_INTERVAL_S` (0.1 s), alongside the mid-move position report — both
+  while the axis is moving (`_wait_motion()`) and while it settles
+  (`_wait_until_still()`). One method for both paths means one signal, one
+  log-on-change state and one failed-read rule, and **it is the single place to
+  put the action once one is decided**: it runs on the worker thread in both
+  cases, so it may issue `ST` directly. Mid-move it costs one more round trip per
+  0.1 s, delaying the limit watch by ~16 ms on those polls only.
+- `motion_tick` is a generic hook — the controller knows nothing about touch
+  alarms. No hook installed (the hardware scripts) means no DI1 reads mid-move.
+  The mock has neither hook; its moves land instantly.
+- **It costs one round trip (~16 ms) per poll cycle**, which lengthens the cycle
+  and therefore the jog overshoot by the same amount. The ~165 ms cycle figures
+  elsewhere in these notes were measured before it existed.
+
+### Window size (2026-10-08)
+
+`run.py` opens the window at `window.sizeHint()`, which is the largest panel
+(the jog panel), about **1123×642**. It used to force `setMinimumSize(1280, 800)`
+and `resize(1400, 860)`. Every panel lays out top-down and ends in `addStretch()`,
+so the extra height was blank space under all of them. The layouts' own minimums
+stop the window shrinking further, and it can still be enlarged or maximised.
+
+- **The window does NOT resize per page, and that is a decision** (user,
+  2026-10-08). Settings and Log are shorter than the jog panel and keep some
+  space at the bottom. Resizing on every page switch would move HALT/E-STOP in
+  the bottom bar. Leave it.
+- At the content size, layouts squeeze anything that has no height of its own.
+  So these are now sized explicitly:
+  - the **Limit Switch Status table** is fixed at exactly three rows. The old
+    `setMaximumHeight(120)` had been clipping the C row behind a scrollbar;
+  - the **Position Memory list** has a 120 px minimum, enough for 4 slots,
+    otherwise it shrinks to 3;
+  - the **Settings soft-limit table** is fixed at its three rows. The old
+    `setMinimumHeight(140)` left an empty band under them.
+- **Other PCs: Windows display scaling.** Qt 5 rounds the scale factor to a
+  whole number by default, so 125 % ran at 1x (point-size fonts grew, pixel
+  sizes did not: clipped text) and 150 % at 2x (window bigger than the screen).
+  `run.py` sets `HighDpiScaleFactorRoundingPolicy.PassThrough`, before the
+  `QApplication` exists. This PC is 1920×1080 at 100 %, the one setting where
+  rounding changes nothing, which is why it never showed here.
+- **Each panel sits in a `_PanelScroll`** (`main_window.py`), a `QScrollArea`
+  whose size hint is the panel's FULL hint (a stock one caps at ~36×24 lines and
+  would shrink the window). `run.py`'s `_fit_to_screen()` clamps the window to
+  the available screen, so a small laptop scrolls the panel while the bottom bar
+  (HALT/E-STOP) stays visible. The scroll areas are `Qt.NoFocus`: a focused
+  scroll area would eat the arrow and Page keys used for jogging.
+- Simulate other scalings with `QT_SCALE_FACTOR=1.5` (and `1.75` for a small
+  laptop) plus `QT_QPA_PLATFORM=windows`.
+- **Adding a widget to the jog panel makes the window taller or wider**, since
+  it sets the window's size. Check the result by rendering the window at
+  `sizeHint()` with `QT_QPA_PLATFORM=windows` and the real
+  `ui/dark_theme.qss`. Without the stylesheet the sizes come out noticeably
+  different.
+
+### Connecting on another PC (2026-10-08)
+
+A peer's PC found the controller's port with Scan Network but could not connect.
+**Fixed in 1.1.1 and confirmed on that laptop** - see the end of this section. Two panel
+bugs could each produce exactly this, and both are fixed:
+
+- **A scan double-click wrote into the Ethernet field even in Serial mode.** That
+  field is hidden then, and CONNECT reads the COM combo, so it opened the OLD
+  port. A COM address now switches to Serial and selects it.
+- **The COM list was a fixed COM1–COM8**, plus the bundled `last_address`, which
+  was THIS PC's `COM4`. On a peer's PC that offered a port that did not exist
+  and could not offer an adapter at COM9+. The list now comes from the registry
+  (`HARDWARE\DEVICEMAP\SERIALCOMM`, `list_serial_ports()`), with a Refresh
+  button; COM1–8 is the fallback only if the registry cannot be read. A
+  remembered port absent on this PC is not preselected.
+- `seed_user_config()` blanks `last_address` in a **freshly seeded**
+  settings.json, so new installs do not inherit the build PC's port. Existing
+  installs keep theirs.
+- A failed connect now says which address it tried and why it may have failed
+  (port absent, held by another program, baud mismatch), and logs it.
+
+**Follow-up the same day: it still failed on 1.1.0**, with the new "Could not
+open COMn ... another copy of this app ... baud rate" hint - so the port EXISTED
+on the laptop and gclib's open of it failed. gclib gives the same bare
+`connection to hardware not established` for every open failure, so the error
+cannot say why. Changes in **1.1.1**:
+
+- **`GalilController._open()` retries a failed SERIAL open with `--direct`.**
+  gclib routes through Galil's gcaps service whenever one is installed and goes
+  direct only when none is; a stale gcaps from an older Galil install on a laptop
+  is one way a present port fails to open. Serial only - over Ethernet gcaps is
+  what shares the controller's handles. The address that opened (possibly with
+  `--direct`) is what `reconnect()` reuses; `last_address` stores port + baud
+  only, so each launch tries the normal route first.
+- **The port's kind is shown under the COM combo**, from the registry's device
+  name: `\Device\VCP*` is an FTDI USB-serial adapter, which is what the rig
+  uses (**FT232R, VID 0403 PID 6001, "USB Serial Port (COM4)" on this PC**), as
+  opposed to `BthModem` (Bluetooth) or `Serial` (built-in). Laptops list several.
+
+**Confirmed working on the peer's laptop with 1.1.1** (user, 2026-10-08): it
+connects to the controller. WHICH change fixed it was not recorded. The laptop's
+log (`%LOCALAPPDATA%\GalilControllerSuite\logs\galil_log.txt`) answers it: a line
+`Opened COMn --direct: the gcaps route failed...` means the gcaps bypass was
+the fix; no such line means the plain open worked and it was the port selection
+(wrong port picked, or the scan double-click bug). Worth checking before
+touching `_open()` or the port list, so the working path is not removed by
+accident.
+
+Ruled out: missing DLLs (the bundled gclib DLLs import only Windows system DLLs,
+and the peer's scan working proves they loaded) and gclib's default baud (115200,
+the same as this rig's).
 
 ### Soft travel limits, and the new Settings panel (2026-09-24)
 
@@ -1965,29 +2266,20 @@ the same treatment** — check `config/` is unchanged after a suite run.
 
 ### Testing
 
-`pytest` is **not installed** in `Software/venv` or on the system python, so
-`pytest tests/ -v` does not currently run. **261 tests across 13 files**, all
-passing as of 2026-09-24, executed with a minimal stand-in runner. The files are
-ordinary pytest and will run under it once installed.
+**`pytest` is installed in `Software/venv` (confirmed 2026-10-08)** —
+`python -m pytest tests/ -q` runs the real thing. **334 tests across 16 files**,
+all passing as of 2026-10-08 (after the retract fixes).
 
-**The stand-in runner lives in the session scratchpad, not the repo**, so it is
-gone once that session ends — the same situation as the manual build script. It
-grew as the suite needed it, and rebuilding it is the tax on not having pytest.
-By the end of 2026-09-24 it supported: fixtures, fixtures that depend on other
-fixtures, `tmp_path`, yield-fixtures with teardown, `pytest.approx`,
-`pytest.raises(match=...)`, stacked `parametrize` decorators as a cross product,
-and per-test fixture caching.
-
-**Three of those were added because a test FAILED for the runner's reasons, not
-the code's** — most instructively the fixture caching: without it `soft` and
-`settings` each got their OWN `AppSettings`, so configuring a limit in the test
-had no effect on the object under test and 7 tests failed misleadingly.
-**Installing pytest would retire all of this**; until then, suspect the runner
-before the code when a failure looks impossible.
+Until then the suite ran under a hand-written stand-in runner in a session
+scratchpad, and three of its features were added because tests failed for the
+RUNNER's reasons rather than the code's (most instructively, missing fixture
+caching gave `soft` and `settings` separate `AppSettings` objects and failed 7
+tests misleadingly). That runner is retired; the lesson — suspect the harness
+when a failure looks impossible — still stands.
 
 | file | tests | covers |
 |---|---|---|
-| `test_move_microns.py` | 48 | the closed loop end to end |
+| `test_move_microns.py` | 52 | the closed loop end to end, and the mid-move position reports |
 | `test_zero_offsets.py` | 18 | the two display origins, migration, home target |
 | `test_mock_limits.py` | 19 | mock limit-switch model |
 | `test_logging.py` | 24 | every action emits its log line |
@@ -1997,9 +2289,12 @@ before the code when a failure looks impossible.
 | `test_arrow_jog.py` | 19 | jog API agreement, the limit guard incl. escaping, jog-key ownership, Page Up/Down on Z |
 | `test_limit_wiring.py` | 24 | `CN 1` polarity, one switch per axis, which end a trip means, and that starting an escape does not re-label it |
 | `test_soft_limits.py` | 12 | software travel bounds, and the stage→controller sign on the reversed axes |
-| `test_z_retract.py` | 34 | the blind retract/insert: direction, suspended bounds, the encoder stop condition, the Z lockout, both prompts and the persisted state |
+| `test_z_retract.py` | 51 | the blind retract/insert: direction, suspended bounds, the encoder stop condition, the Z lockout, both prompts, the persisted state, the on-connect encoder check, the Enable Motors gate, and the blind clock starting at the jog |
 | `test_axis_direction.py` | 23 | the Y/Z software reversal at every boundary it crosses |
 | `test_position_memory.py` | 6 | slot storage |
+| `test_touch_alarm.py` | 11 | DI1 polarity (0 = alarm), a failed read shows unknown not Off, `MG @IN[1]`, the box colours, read mid-move and report-only |
+| `test_app_paths.py` | 21 | config/log locations from source vs frozen, first-run seeding, the build PC's port not inherited |
+| `test_connection_panel.py` | 20 | real COM port list and port kinds, scan double-click lands where CONNECT reads, failure hints, the `--direct` serial retry |
 
 `test_move_microns.py` drives the **real** `GalilController` through a fake gclib
 device (`FakeGalil`) rather than only the mock. It models the 2:1
@@ -2062,13 +2357,18 @@ How it was built, since there is no PDF library installed:
 
 ### Still open
 
+**Opened on 2026-10-08:**
+
+- **What the touch alarm should DO is undecided.** It is read during polls and
+  during moves but only reports. When decided, implement it in
+  `PollingWorker._poll_touch_alarm()` (covers jogs, idle and blocking moves at
+  once) and change `test_an_alarm_during_a_move_is_reported_and_the_move_carries_on`.
+- **The ~165 ms cycle figure predates the touch alarm read** (+~16 ms per
+  cycle). The jog overshoot numbers in these notes are correspondingly a little
+  low; not re-measured.
+
 **Opened or changed on 2026-09-24:**
 
-- **X has no limit switch.** B and C are wired and declared in `LIMIT_INPUT`; A
-  is not. With `LD=3` that leaves X with NO end-stop protection beyond its soft
-  travel bounds and the `travel_mm` guard, and the jog guard can never fire for
-  it. Wire it, then add `"A": "<terminal>"` — `check_limits.py` names the
-  terminal for you.
 - **B's terminal was assumed, not measured.** It was declared `FWD` to match C
   while the controller was powered off. If it is wrong, Y reads permanently at a
   limit; `check_limits.py` prints a MISMATCH row naming the correct terminal.
@@ -2078,12 +2378,15 @@ How it was built, since there is no PDF library installed:
   See its own section for the three candidate fixes; the user deferred it
   deliberately. The blind retract works around it by running at 1000 counts/s
   (~26 µm) rather than by fixing it.
-- **The retract distance is measured but the timer includes the approach.**
-  `_rz_finish()` times from the button press, so the reported blind travel is
-  overstated by however long the closed-loop move to 0 µm takes — the first run
-  reported 100 s / 7.9 mm for a blind phase that was really 94 s / 7.4 mm.
-  Stamping the clock inside `_retract_sequence()` just before the jog would fix
-  both the figure and the bound. Two lines; not done.
+- **FIXED 2026-10-08: the retract timer included the approach.** It ran from
+  the button press, so the closed-loop move to 0 um counted as blind travel. A
+  retract from +40 mm spent 51.6 s approaching - more than the ~22 s blind
+  allowance - and aborted 0.1 s into the jog, stopping at ~0 um. The −100 um soft
+  limit then lit up (correctly: the abort's encoder check found Z on the tape),
+  which made it look like the soft limit had stopped the retract. It had not;
+  soft limits ARE suspended for the whole retract. `_retract_sequence()` now
+  restarts the clock once the jog is running, which also makes the logged blind
+  distance true.
 - **`BLIND_MAX_TRAVEL_UM` (10.5 mm) has not been re-checked since the speed
   doubled.** The real travel is ~7.4 mm, so the margin is fine, but the bound
   was chosen against a 10 mm estimate that turned out high.
@@ -2150,7 +2453,7 @@ How it was built, since there is no PDF library installed:
 ## Shipping it: the Windows installer (2026-09-24)
 
 `python packaging/build_installer.py` produces one
-`GalilControllerSuite-Setup-<version>.exe` that carries the Python interpreter,
+`StorkController-Setup-<version>.exe` (`GalilControllerSuite-Setup-` up to 1.1.3) that carries the Python interpreter,
 PyQt5, numpy, pydantic, loguru and the gclib DLLs. **The target machine needs no
 Python, no pip, no venv and no terminal.** Per-user install by default, so no
 administrator rights. See `packaging/README.md` for the build prerequisites.
@@ -2204,6 +2507,40 @@ new version adds without discarding the rig's own calibration.
   now. **If that cast is ever replaced with a plain `int()`, numpy can be dropped
   from both.**
 
+### The Stork name (1.2.0, 2026-10-12)
+
+The user asked that the END USER see "Stork Controller" while the project keeps
+"Galil" everywhere internally. Where the line falls:
+
+| says **Stork** | still says **Galil** — deliberately |
+|---|---|
+| window title, `QApplication` name, sidebar label (`STORK / CONTROLLER`) | every module, class (`GalilController`, `GalilMainWindow`) and the repo |
+| `StorkController.exe`, `_dist/StorkController/`, the setup file name | `galil_suite.spec` (file name only) and `galil_log.txt` |
+| installer wizard, Start menu, desktop shortcut, Add/Remove Programs | **`%LOCALAPPDATA%\GalilControllerSuite`** — see below |
+| | the hardware: Controller Info still reports DMC-4133, tooltips name Galil's `SH` and GalilTools, which are real Galil things |
+
+- **One constant: `utils/app_paths.DISPLAY_NAME`.** `run.py` takes the title and
+  app name from it. The installer has its own copy in `installer.iss`
+  (`MyAppName`) and `build_installer.py` has `APP_DIR`, which must match the
+  spec's `name=` and `MyAppExeName`.
+- **`APP_NAME` (the user-data folder) was NOT renamed.** It holds each PC's
+  calibration — zero offsets, saved positions, Z retract state. Renaming it
+  would make an upgrade start from the shipped defaults with nothing to say so.
+- **`MyAppId` was NOT changed**, so 1.2.0 upgrades a 1.1.x install in place:
+  same folder (Inno reuses the previous directory, so an upgraded PC keeps
+  `...\GalilControllerSuite\` as its install folder; only fresh installs get
+  `StorkController`), same uninstall entry, now named Stork.
+- **`[InstallDelete]` cleans up the old name**: `GalilControllerSuite.exe` in the
+  install folder, the "Galil Controller Suite" Start-menu group and desktop
+  shortcut. Without it an upgraded PC keeps a working shortcut to the OLD exe,
+  which still runs — so a peer could keep launching 1.1.x without knowing.
+  `UsePreviousGroup=no` for the same reason: the previous group is the one
+  being deleted.
+- **The window icon** is set on the `QApplication` from
+  `app_paths.icon_path()` (`packaging/stork.ico`, bundled by the spec at the same
+  relative path). `run.py` also sets an explicit AppUserModelID so that, run from
+  source, the taskbar shows the stork instead of grouping under python.exe.
+
 ### Config is read at IMPORT time
 
 `galil_controller` and `mock_controller` build their scale tables from
@@ -2226,7 +2563,7 @@ caused by packaging — but peers meet it on first launch, so the README says so
 python run.py --mock              # no hardware required
 python run.py --address COM4      # or an IP address
 
-pytest tests/ -v                  # NOTE: pytest is not installed in Software/venv
+python -m pytest tests/ -q        # 334 tests, ~45 s
 
 python test_move_microns_hw.py C          # accuracy/repeatability of move_microns
 python test_move_microns_hw.py C --verify # with vs without the verify pass

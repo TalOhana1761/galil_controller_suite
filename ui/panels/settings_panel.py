@@ -85,7 +85,6 @@ class SettingsPanel(QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionMode(QAbstractItemView.NoSelection)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self._table.setMinimumHeight(140)
 
         for row, ax in enumerate(AXES):
             name = QTableWidgetItem(f"{AXIS_NAME[ax]}  ({ax})")
@@ -110,6 +109,13 @@ class SettingsPanel(QWidget):
                 self._spins[(ax, side)] = spin
                 self._table.setCellWidget(row, col, spin)
 
+        # Exactly as tall as its rows: three axes never scroll, and a fixed
+        # minimum left an empty band under them.
+        self._table.resizeRowsToContents()
+        self._table.setFixedHeight(
+            self._table.horizontalHeader().sizeHint().height()
+            + sum(self._table.rowHeight(r) for r in range(len(AXES)))
+            + 2 * self._table.frameWidth())
         v.addWidget(self._table)
 
         row = QHBoxLayout()

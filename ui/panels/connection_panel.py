@@ -19,6 +19,105 @@ from PyQt5.QtGui import QFont
 
 _SERIAL_RE = re.compile(r"COM\d+", re.IGNORECASE)
 
+# Offered when the real port list cannot be read (not Windows, registry denied).
+_FALLBACK_PORTS = [f"COM{n}" for n in range(1, 9)]
+
+
+def _com_sort_key(port: str):
+    m = re.search(r"\d+", port)
+    return int(m.group()) if m else 0
+
+
+def _read_serialcomm():
+    r"""{port: kernel device name} from the registry, or None if unreadable.
+
+    The device name says what kind of port it is: \Device\VCP0 is an FTDI
+    USB-serial adapter (the rig's is an FT232R, VID 0403 PID 6001),
+    \Device\Serial0 a built-in port, \Device\BthModem0 Bluetooth.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                             r"HARDWARE\DEVICEMAP\SERIALCOMM")
+    except OSError:
+        return {}           # key absent = no serial ports at all
+    found = {}
+    try:
+        i = 0
+        while True:
+            try:
+                device, value, _ = winreg.EnumValue(key, i)
+            except OSError:
+                break
+            if isinstance(value, str) and _SERIAL_RE.fullmatch(value.strip()):
+                found[value.strip().upper()] = device
+            i += 1
+    finally:
+        winreg.CloseKey(key)
+    return found
+
+
+def list_serial_ports():
+    """The COM ports that exist on THIS PC right now, e.g. ['COM3', 'COM11'].
+
+    Read from the registry key Windows itself keeps for serial devices, which
+    includes USB-to-serial adapters while they are plugged in. Returns None if
+    it cannot be read - not the same as an empty list, which means "no ports".
+
+    A fixed COM1-COM8 list was offered before 2026-10-08. On another PC the
+    controller's adapter can be COM9 or above and so could not be selected at
+    all, while the list happily offered ports that did not exist there.
+    """
+    found = _read_serialcomm()
+    if found is None:
+        return None
+    return sorted(found, key=_com_sort_key)
+
+
+_PORT_KINDS = [            # (substring of the device name, what to call it)
+    ("vcp", "USB serial adapter (FTDI) - the rig uses one of these"),
+    ("usbser", "USB serial device"),
+    ("prolific", "USB serial adapter (Prolific)"),
+    ("silab", "USB serial adapter (Silicon Labs)"),
+    ("ch341", "USB serial adapter (CH340)"),
+    ("bth", "Bluetooth - not the controller"),
+    ("serial", "built-in serial port"),
+]
+
+
+def describe_serial_port(port: str) -> str:
+    """What kind of port `port` is, or "" if that cannot be told."""
+    found = _read_serialcomm() or {}
+    device = found.get((port or "").upper(), "").lower()
+    if not device:
+        return ""
+    for needle, label in _PORT_KINDS:
+        if needle in device:
+            return label
+    return device.rsplit("\\", 1)[-1]
+
+
+def connect_failure_hint(address: str, err: str) -> str:
+    """Turn a bare gclib error into something an operator can act on."""
+    port = address.split()[0] if address.strip() else address
+    if _SERIAL_RE.fullmatch(port or ""):
+        present = list_serial_ports()
+        if present is not None and port.upper() not in present:
+            where = ", ".join(present) if present else "none"
+            return (f"{err}\n{port} does not exist on this PC "
+                    f"(ports present: {where}). Select the controller's port.")
+        kind = describe_serial_port(port)
+        return (f"{err}\nCould not open {port}"
+                f"{' (' + kind + ')' if kind else ''}. Check that it is the "
+                f"controller's port (in Device Manager the rig's adapter is "
+                f"'USB Serial Port (COMn)'), that the controller is powered, "
+                f"that no other program (GDK, GalilTools, another copy of this "
+                f"app) has it open, and that the baud rate is 115200.")
+    return err
+
 
 def _split_address(addr: str):
     """Split a gclib address into (port, baud).
@@ -132,10 +231,21 @@ class ConnectionPanel(QWidget):
         sg = QGridLayout(self._ser_grp)
         sg.addWidget(QLabel("COM Port:"), 0, 0)
         self._com_combo = QComboBox()
-        self._com_combo.addItems(["COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8"])
         self._com_combo.setPlaceholderText("— select a port —")
-        self._com_combo.setCurrentIndex(-1)
+        self._populate_com_ports()
         sg.addWidget(self._com_combo, 0, 1)
+        self._btn_refresh_ports = QPushButton("Refresh")
+        self._btn_refresh_ports.setToolTip(
+            "Re-read the COM ports present on this PC\n"
+            "(e.g. after plugging in the USB-serial adapter)")
+        self._btn_refresh_ports.clicked.connect(self._populate_com_ports)
+        sg.addWidget(self._btn_refresh_ports, 0, 2)
+        # Which KIND of port is selected: a laptop lists Bluetooth and built-in
+        # ports too, and nothing in "COM5" says which one is the rig's adapter.
+        self._port_kind_lbl = QLabel("")
+        self._port_kind_lbl.setObjectName("port_kind")
+        self._com_combo.currentTextChanged.connect(self._show_port_kind)
+        sg.addWidget(self._port_kind_lbl, 2, 1, 1, 2)
         sg.addWidget(QLabel("Baud Rate:"), 1, 0)
         self._baud_combo = QComboBox()
         self._baud_combo.addItems(["115200","19200","9600"])
@@ -201,6 +311,38 @@ class ConnectionPanel(QWidget):
         root.addWidget(info_grp)
         root.addStretch()
 
+    # ── COM port list ───────────────────────────────────────────────────────
+
+    def _populate_com_ports(self, *_):
+        """Fill the COM combo with the ports present on this PC.
+
+        Keeps the current selection if that port is still there; otherwise
+        nothing is selected, rather than silently offering a different port.
+        """
+        current = self._com_combo.currentText()
+        ports = list_serial_ports()
+        self._ports_known = ports is not None
+        if ports is None:
+            ports = list(_FALLBACK_PORTS)
+        self._com_combo.blockSignals(True)
+        self._com_combo.clear()
+        self._com_combo.addItems(ports)
+        self._com_combo.setCurrentIndex(
+            ports.index(current) if current in ports else -1)
+        self._com_combo.blockSignals(False)
+        self._show_port_kind(self._com_combo.currentText())
+
+    def _show_port_kind(self, port: str):
+        if hasattr(self, "_port_kind_lbl"):
+            self._port_kind_lbl.setText(describe_serial_port(port))
+
+    def _select_com_port(self, port: str):
+        """Select `port` in the COM combo, adding it if it is not listed."""
+        port = port.upper()
+        if self._com_combo.findText(port) < 0:
+            self._com_combo.addItem(port)
+        self._com_combo.setCurrentText(port)
+
     # ── Last connected address ──────────────────────────────────────────────
 
     def _restore_last_address(self):
@@ -216,9 +358,13 @@ class ConnectionPanel(QWidget):
 
         if _SERIAL_RE.fullmatch(port):
             port = port.upper()
-            if self._com_combo.findText(port) < 0:
-                self._com_combo.addItem(port)   # remembered a port outside COM1-8
-            self._com_combo.setCurrentText(port)
+            # A remembered port that does not exist on THIS PC is not offered.
+            # The installer used to ship this rig's "COM4", so on a peer's PC
+            # the panel opened on a port that was never theirs.
+            if self._ports_known and self._com_combo.findText(port) < 0:
+                self._rb_ser.setChecked(True)
+                return
+            self._select_com_port(port)
             if baud:
                 if self._baud_combo.findText(baud) < 0:
                     self._baud_combo.addItem(baud)   # a rate outside the usual three
@@ -308,9 +454,13 @@ class ConnectionPanel(QWidget):
         self.connected.emit(self.controller, self.worker)
 
     def _on_connect_failed(self, err: str):
+        addr = self._connect_thread.address if self._connect_thread else ""
+        msg = connect_failure_hint(addr, err)
+        logger.error(f"Connect to '{addr}' failed: {msg}")
         self._btn_connect.setText("CONNECT")
         self._btn_connect.setEnabled(True)
-        self._status_lbl.setText(f"● Failed: {err}")
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setText(f"● Failed ({addr}): {msg}")
 
     def _on_disconnect(self):
         self._uptime_timer.stop()
@@ -349,6 +499,7 @@ class ConnectionPanel(QWidget):
         self._scan_list.clear()
         self._btn_scan.setText("Scan Network")
         self._btn_scan.setEnabled(True)
+        self._populate_com_ports()
         if not addrs:
             self._scan_list.addItem("No controllers found")
             return
@@ -358,9 +509,23 @@ class ConnectionPanel(QWidget):
             self._scan_list.addItem(item)
 
     def _on_scan_item_selected(self, item: QListWidgetItem):
+        """Put the chosen address where CONNECT will actually read it.
+
+        This used to write into the Ethernet field unconditionally. With the
+        panel in Serial mode - which it is whenever the last address was a COM
+        port - that field is hidden and CONNECT reads the COM combo instead, so
+        double-clicking the controller's port and pressing CONNECT opened the
+        OLD port. A COM address now switches to Serial and selects the port.
+        """
         addr = item.data(Qt.UserRole)
-        if addr:
+        if not addr:
+            return
+        if _SERIAL_RE.fullmatch(addr):
+            self._select_com_port(addr)
+            self._rb_ser.setChecked(True)
+        else:
             self._addr_input.setText(addr)
+            self._rb_eth.setChecked(True)
 
     # ── Uptime ──────────────────────────────────────────────────────────────
 

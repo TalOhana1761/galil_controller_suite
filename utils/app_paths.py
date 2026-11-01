@@ -32,6 +32,13 @@ import sys
 
 APP_NAME = "GalilControllerSuite"
 
+# What the OPERATOR sees: window title, taskbar, Start menu, installer. The
+# manipulator is called "Stork"; "Galil" is the controller inside it and stays
+# the name in the code. APP_NAME above is deliberately NOT renamed with it - it
+# names the %LOCALAPPDATA% folder holding every installed PC's calibration, and
+# renaming it would make an upgrade start from the shipped defaults.
+DISPLAY_NAME = "Stork Controller"
+
 
 def is_frozen() -> bool:
     """True when running from a PyInstaller build rather than from source."""
@@ -50,6 +57,12 @@ def install_root() -> str:
             return os.path.abspath(base)
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def icon_path() -> str:
+    """The stork icon, drawn by packaging/make_icon.py. In the repo it sits in
+    packaging/; the spec bundles it at the same relative path."""
+    return os.path.join(install_root(), "packaging", "stork.ico")
 
 
 def user_data_dir() -> str:
@@ -111,7 +124,30 @@ def seed_user_config() -> None:
             try:
                 shutil.copy2(s, d)
             except OSError:
-                pass
+                continue
+            if name == "settings.json":
+                _forget_build_machine_address(d)
+
+
+def _forget_build_machine_address(path: str) -> None:
+    """Blank ``last_address`` in a freshly seeded settings.json.
+
+    The bundled settings.json is the build machine's, so it carries the port
+    THAT PC connected on ("COM4"). It is per-PC, not calibration: a peer's
+    adapter enumerates under its own number, and inheriting ours opened the
+    panel on a port that does not exist there. Empty means "nothing has
+    connected on this install yet", which the connection panel handles.
+    """
+    import json
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        if cfg.get("last_address"):
+            cfg["last_address"] = ""
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+    except (OSError, ValueError):
+        pass
 
 
 def add_bundled_dll_dir() -> None:

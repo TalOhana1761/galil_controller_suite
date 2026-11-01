@@ -66,6 +66,15 @@ def test_enable_axes_sets_the_limit_inputs_active_high(hw):
         "controller's CN=-1 default")
 
 
+def test_enable_axes_sets_drive_current_per_motor(hw):
+    """X/Y motors are 1 A, Z's is 3 A. AG must land while the axis is off."""
+    hw.enable_axes("ABC")
+    cmds = hw._g.commands
+    for cmd in ("AGA=1", "AGB=1", "AGC=3"):
+        assert cmd in cmds, f"{cmd} not sent"
+        assert cmds.index("MOABC") < cmds.index(cmd) < cmds.index("SHABC")
+
+
 def test_cn_is_sent_once_not_per_axis(hw):
     """CN is global - one setting for all six inputs on all three axes."""
     hw.enable_axes("ABC")
